@@ -3233,13 +3233,6 @@ async fn main() -> Result<()> {
         if let Some(switch_hours) = config.multi_switch_time {
             let switch_secs = (switch_hours * 3600.0) as u64;
             let remaining_secs = switch_secs.saturating_sub(previous_session_secs);
-            if remaining_secs == 0 {
-                // Session time already exceeds switch threshold — switch immediately.
-                info!(
-                    "[AccountSwitch] Session time ({:.1}h) already exceeds switch threshold ({:.1}h) — switching now",
-                    previous_session_secs as f64 / 3600.0, switch_hours
-                );
-            }
             let next_index = (current_account_index + 1) % ingame_names.len();
             let next_name = ingame_names[next_index].clone();
             let index_path = account_index_path.clone();
@@ -3248,13 +3241,23 @@ async fn main() -> Result<()> {
             let ws_switch = ws_client.clone();
             let session_times_path_switch = session_times_path.clone();
             let ign_switch = ingame_name.clone();
-            info!(
-                "[AccountSwitch] Will switch from {} to {} in {:.1}h (total {:.1}h, already {:.1}h)",
-                ingame_name, next_name, remaining_secs as f64 / 3600.0,
-                switch_hours, previous_session_secs as f64 / 3600.0
-            );
+            if remaining_secs == 0 {
+                info!(
+                    "[AccountSwitch] Session time ({:.1}h) already exceeds switch threshold ({:.1}h) — will switch after 30s startup grace",
+                    previous_session_secs as f64 / 3600.0, switch_hours
+                );
+            } else {
+                info!(
+                    "[AccountSwitch] Will switch from {} to {} in {:.1}h (total {:.1}h, already {:.1}h)",
+                    ingame_name, next_name, remaining_secs as f64 / 3600.0,
+                    switch_hours, previous_session_secs as f64 / 3600.0
+                );
+            }
             tokio::spawn(async move {
-                sleep(Duration::from_secs(remaining_secs)).await;
+                // When remaining_secs is 0 (threshold already exceeded), wait
+                // 30s to allow the bot to connect and transfer the license.
+                let delay = if remaining_secs == 0 { 30 } else { remaining_secs };
+                sleep(Duration::from_secs(delay)).await;
                 info!(
                     "[AccountSwitch] Switch time reached — switching to account {} ({})",
                     next_index + 1, next_name

@@ -16,7 +16,7 @@ const UNSTACKABLE_TAG_PREFIXES: &[&str] = &[
 /// Checks both the item name and the optional item tag.
 pub fn is_unstackable_item(item_name: &str, item_tag: Option<&str>) -> bool {
     let lower = item_name.to_lowercase();
-    if UNSTACKABLE_ITEM_NAMES.iter().any(|&n| lower == n) {
+    if UNSTACKABLE_ITEM_NAMES.iter().any(|&n| lower.contains(n)) {
         return true;
     }
     if let Some(tag) = item_tag {
