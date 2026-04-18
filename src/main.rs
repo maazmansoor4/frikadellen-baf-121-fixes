@@ -691,6 +691,16 @@ async fn main() -> Result<()> {
         });
     }
 
+    // If a VPS_SECRET environment variable is present, connect to the managed
+    // hosting backend at wss://sky.coflnet.com/instances.  This allows the
+    // SkyCofl backend to orchestrate instances running on this host.
+    if let Some(vps_socket) = frikadellen_baf::vps::VpsSocket::from_env() {
+        info!("[VPS] VPS_SECRET detected — starting managed hosting socket");
+        tokio::spawn(async move {
+            vps_socket.run().await;
+        });
+    }
+
     // Connect to Hypixel — Azalea will handle Microsoft OAuth (device-code URL
     // is printed to the terminal; the Coflnet auth link is sent via chat_tx and
     // appears in the web panel automatically).
@@ -849,6 +859,32 @@ async fn main() -> Result<()> {
                 }
                 frikadellen_baf::bot::BotEvent::WindowOpen(id, window_type, title) => {
                     debug!("Window opened: {} (ID: {}, Type: {})", title, id, window_type);
+
+                    // When the "Bazaar Orders" or "Co-op Bazaar Orders" window
+                    // opens, send the full window NBT data to COFL so bazaar
+                    // order state stays in sync with the SkyCofl backend.
+                    let title_lower = title.to_lowercase();
+                    if title_lower.contains("bazaar orders") || title_lower.contains("co-op bazaar orders") {
+                        let ws_upload = ws_client_for_events.clone();
+                        let bot_upload = bot_client_clone.clone();
+                        tokio::spawn(async move {
+                            // Wait for ContainerSetContent to populate all slots.
+                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                            if let Some(window_json) = bot_upload.get_cached_window_json() {
+                                let msg = serde_json::json!({
+                                    "type": "UploadBazaar",
+                                    "data": window_json
+                                }).to_string();
+                                if let Err(e) = ws_upload.send_message(&msg).await {
+                                    tracing::warn!("[UploadBazaar] Failed to send bazaar window data: {}", e);
+                                } else {
+                                    tracing::info!("[UploadBazaar] Sent bazaar window data to COFL");
+                                }
+                            } else {
+                                tracing::debug!("[UploadBazaar] No cached window JSON available");
+                            }
+                        });
+                    }
                 }
                 frikadellen_baf::bot::BotEvent::WindowClose => {
                     debug!("Window closed");
