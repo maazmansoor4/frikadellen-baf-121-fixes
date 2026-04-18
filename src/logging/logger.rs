@@ -1,8 +1,37 @@
 use anyhow::Result;
 use once_cell::sync::Lazy;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{filter::LevelFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
+
+/// When `true`, the logger prefixes all messages with `userId:instanceId`.
+/// Set once at startup via `set_vps_log_prefix`.
+static VPS_MODE: AtomicBool = AtomicBool::new(false);
+
+/// Prefix string used in VPS mode: `"userId:instanceId "`.
+static VPS_PREFIX: Lazy<std::sync::Mutex<String>> =
+    Lazy::new(|| std::sync::Mutex::new(String::new()));
+
+/// Enable VPS-mode logging.  All subsequent log messages (via `print_mc_chat`
+/// and tracing macros) will be prefixed with `userId:instanceId`.
+pub fn set_vps_log_prefix(user_id: &str, instance_id: &str) {
+    let prefix = format!("{}:{}", user_id, instance_id);
+    if let Ok(mut p) = VPS_PREFIX.lock() {
+        *p = prefix;
+    }
+    VPS_MODE.store(true, Ordering::Relaxed);
+}
+
+/// Returns the VPS prefix string (e.g. `"user123:inst-abc"`) if VPS mode is
+/// active, or an empty string otherwise.
+pub fn vps_prefix() -> String {
+    if VPS_MODE.load(Ordering::Relaxed) {
+        VPS_PREFIX.lock().map(|p| p.clone()).unwrap_or_default()
+    } else {
+        String::new()
+    }
+}
 
 pub fn init_logger() -> Result<()> {
     let logs_dir = get_logs_dir();
@@ -201,8 +230,13 @@ pub fn mc_to_ansi(text: &str) -> String {
 
 /// Print a Minecraft chat message to console (with color code processing)
 pub fn print_mc_chat(message: &str) {
+    let prefix = vps_prefix();
     let colored = mc_to_ansi(message);
-    println!("{}", colored);
+    if prefix.is_empty() {
+        println!("{}", colored);
+    } else {
+        println!("[{}] {}", prefix, colored);
+    }
 }
 
 #[cfg(test)]

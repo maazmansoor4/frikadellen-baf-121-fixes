@@ -656,20 +656,6 @@ async fn main() -> Result<()> {
     // Shared tracker for active bazaar orders (web panel + profit calculation).
     let bazaar_tracker = Arc::new(frikadellen_baf::bazaar_tracker::BazaarOrderTracker::new());
 
-    // Shared connection state exposed to the web panel.  Starts false until the
-    // bot successfully logs in and completes the startup workflow.
-    let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-    // Tracks whether the startup workflow's 4 steps have completed.  Flips are
-    // blocked until this is true so the bot never flips before startup is done.
-    let startup_completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-    // Rolling buffer of recent auction flip recommendations for the web panel.
-    let recent_flips: Arc<std::sync::Mutex<std::collections::VecDeque<frikadellen_baf::web::RecentFlip>>> =
-        Arc::new(std::sync::Mutex::new(std::collections::VecDeque::with_capacity(
-            frikadellen_baf::web::RECENT_FLIPS_CAPACITY,
-        )));
-
     // Start web control panel server BEFORE bot connect so the chat GUI
     // is available to show login links during Microsoft/Coflnet auth.
     {
@@ -698,12 +684,20 @@ async fn main() -> Result<()> {
             anonymize_webhook_name: anonymize_webhook_name.clone(),
             bazaar_tracker: bazaar_tracker.clone(),
             config_loader: config_loader.clone(),
-            connected: connected.clone(),
-            recent_flips: recent_flips.clone(),
         };
         let web_port = config.web_gui_port;
         tokio::spawn(async move {
             start_web_server(web_state, web_port).await;
+        });
+    }
+
+    // If a VPS_SECRET environment variable is present, connect to the managed
+    // hosting backend at wss://sky.coflnet.com/instances.  This allows the
+    // SkyCofl backend to orchestrate instances running on this host.
+    if let Some(vps_socket) = frikadellen_baf::vps::VpsSocket::from_env() {
+        info!("[VPS] VPS_SECRET detected — starting managed hosting socket");
+        tokio::spawn(async move {
+            vps_socket.run().await;
         });
     }
 
@@ -793,8 +787,6 @@ async fn main() -> Result<()> {
     let enable_ah_flips_events = enable_ah_flips.clone();
     let profit_tracker_events = profit_tracker.clone();
     let bazaar_tracker_events = bazaar_tracker.clone();
-    let connected_events = connected.clone();
-    let startup_completed_events = startup_completed.clone();
     // Tracks when the last AH auction was listed; the idle-inventory timer uses
     // this to detect 30-minute stalls and force `/cofl sellinventory`.
     let last_auction_listed_at: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
@@ -806,7 +798,6 @@ async fn main() -> Result<()> {
             match event {
                 frikadellen_baf::bot::BotEvent::Login => {
                     info!("✓ Bot logged into Minecraft successfully");
-                    connected_events.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
                 frikadellen_baf::bot::BotEvent::Spawn => {
                     info!("✓ Bot spawned in world and ready");
@@ -868,16 +859,38 @@ async fn main() -> Result<()> {
                 }
                 frikadellen_baf::bot::BotEvent::WindowOpen(id, window_type, title) => {
                     debug!("Window opened: {} (ID: {}, Type: {})", title, id, window_type);
+
+                    // When the "Bazaar Orders" or "Co-op Bazaar Orders" window
+                    // opens, send the full window NBT data to COFL so bazaar
+                    // order state stays in sync with the SkyCofl backend.
+                    let title_lower = title.to_lowercase();
+                    if title_lower.contains("bazaar orders") || title_lower.contains("co-op bazaar orders") {
+                        let ws_upload = ws_client_for_events.clone();
+                        let bot_upload = bot_client_clone.clone();
+                        tokio::spawn(async move {
+                            // Wait for ContainerSetContent to populate all slots.
+                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                            if let Some(window_json) = bot_upload.get_cached_window_json() {
+                                let msg = serde_json::json!({
+                                    "type": "UploadBazaar",
+                                    "data": window_json
+                                }).to_string();
+                                if let Err(e) = ws_upload.send_message(&msg).await {
+                                    tracing::warn!("[UploadBazaar] Failed to send bazaar window data: {}", e);
+                                } else {
+                                    tracing::info!("[UploadBazaar] Sent bazaar window data to COFL");
+                                }
+                            } else {
+                                tracing::debug!("[UploadBazaar] No cached window JSON available");
+                            }
+                        });
+                    }
                 }
                 frikadellen_baf::bot::BotEvent::WindowClose => {
                     debug!("Window closed");
                 }
                 frikadellen_baf::bot::BotEvent::Disconnected(reason) => {
                     warn!("Bot disconnected: {}", reason);
-                    connected_events.store(false, std::sync::atomic::Ordering::Relaxed);
-                    // Any pending flips are irrelevant once the connection is
-                    // gone, and startup needs to run again on reconnect.
-                    startup_completed_events.store(false, std::sync::atomic::Ordering::Relaxed);
                     if is_ban_disconnect(&reason) {
                         error!("Ban detected — sending webhook and terminating process");
                         if let Some(webhook_url) = config_for_events.active_webhook_url() {
@@ -912,10 +925,6 @@ async fn main() -> Result<()> {
                 }
                 frikadellen_baf::bot::BotEvent::StartupComplete { orders_cancelled } => {
                     info!("[Startup] Startup complete - bot is ready to flip! ({} order(s) cancelled)", orders_cancelled);
-                    // Mark startup as complete — flip intakes gate on this so
-                    // no flips are processed until all 4 startup steps finish.
-                    startup_completed_events.store(true, std::sync::atomic::Ordering::Relaxed);
-                    connected_events.store(true, std::sync::atomic::Ordering::Relaxed);
                     // Clear the bazaar order tracker for a clean slate — the startup
                     // ManageOrders cycle cancelled all in-game orders already.
                     {
@@ -1592,10 +1601,6 @@ async fn main() -> Result<()> {
     let ingame_name_ws = ingame_name.clone();
     let bazaar_tracker_ws = bazaar_tracker.clone();
     let profit_tracker_ws = profit_tracker.clone();
-    let startup_completed_ws = startup_completed.clone();
-    let macro_paused_ws = macro_paused.clone();
-    let connected_ws = connected.clone();
-    let recent_flips_ws = recent_flips.clone();
     // Accumulator for `/cofl bz l` output: (total_profit, flip_count, last_update).
     // Reset when "Last Completed Bazaar Flips" header is seen; each parsed flip
     // line adds to the total.  A debounce task displays the summary after 2s idle.
@@ -1624,34 +1629,9 @@ async fn main() -> Result<()> {
                         continue;
                     }
 
-                    // Block flips until the full 4-step startup workflow has
-                    // completed.  `startup_completed` is flipped true only by
-                    // the `StartupComplete` event, so flips never slip through
-                    // before all 4 steps finish (including reconnects).
-                    if !startup_completed_ws.load(Ordering::Relaxed) {
-                        debug!("Skipping AH flip — startup not complete: {}", flip.item_name);
-                        continue;
-                    }
-
-                    // Block flips while the bot is disconnected (e.g. during
-                    // a rest break or a manual disconnect from the web panel).
-                    if !connected_ws.load(Ordering::Relaxed) {
-                        debug!("Skipping AH flip — bot disconnected: {}", flip.item_name);
-                        continue;
-                    }
-
-                    // Block flips while the macro is paused — covers both the
-                    // manual web-panel pause and the rest-break auto-pause so
-                    // the bot truly stops flipping while resting.
-                    if macro_paused_ws.load(Ordering::Relaxed) {
-                        debug!("Skipping AH flip — macro paused: {}", flip.item_name);
-                        continue;
-                    }
-
-                    // Secondary guard covering the gap where the authoritative
-                    // `startup_completed` flag may not yet reflect a freshly
-                    // started workflow (startup steps can briefly leave the
-                    // bot in Idle between queued commands).
+                    // Block flips until startup workflow is complete — the bot
+                    // state can briefly be Idle between queued startup commands,
+                    // so checking is_startup_in_progress() covers that gap.
                     if bot_client_for_ws.is_startup_in_progress() {
                         debug!("Skipping AH flip during startup: {}", flip.item_name);
                         continue;
@@ -1681,31 +1661,6 @@ async fn main() -> Result<()> {
                     print_mc_chat(&baf_msg);
                     let _ = chat_tx_ws.send(baf_msg);
 
-                    // Record this flip with its estimated profit for the web
-                    // panel's live flip list.  Cap the buffer at
-                    // `RECENT_FLIPS_CAPACITY` so memory stays bounded.
-                    {
-                        let estimated_profit = flip.target as i64 - flip.starting_bid as i64;
-                        let received_at = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        let entry = frikadellen_baf::web::RecentFlip {
-                            item_name: frikadellen_baf::utils::remove_minecraft_colors(&flip.item_name),
-                            starting_bid: flip.starting_bid,
-                            target: flip.target,
-                            estimated_profit,
-                            profit_perc: flip.profit_perc,
-                            finder: flip.finder.clone(),
-                            received_at,
-                        };
-                        if let Ok(mut buf) = recent_flips_ws.lock() {
-                            if buf.len() >= frikadellen_baf::web::RECENT_FLIPS_CAPACITY {
-                                buf.pop_front();
-                            }
-                            buf.push_back(entry);
-                        }
-                    }
                     // Store flip in tracker so ItemPurchased / ItemSold webhooks can include profit
                     {
                         let key = frikadellen_baf::utils::remove_minecraft_colors(&flip.item_name).to_lowercase();
@@ -1734,24 +1689,6 @@ async fn main() -> Result<()> {
                     // Block flips until Coflnet auth is confirmed
                     if !cofl_authenticated_ws.load(Ordering::Relaxed) {
                         debug!("Skipping bazaar flip — Coflnet not yet authenticated: {}", bazaar_flip.item_name);
-                        continue;
-                    }
-
-                    // Block flips until the full 4-step startup workflow has
-                    // completed.  Same guarantee as for AH flips.
-                    if !startup_completed_ws.load(Ordering::Relaxed) {
-                        debug!("Skipping bazaar flip — startup not complete: {}", bazaar_flip.item_name);
-                        continue;
-                    }
-
-                    // Block flips while the bot is disconnected or macro is
-                    // paused (rest break, manual pause, manual disconnect).
-                    if !connected_ws.load(Ordering::Relaxed) {
-                        debug!("Skipping bazaar flip — bot disconnected: {}", bazaar_flip.item_name);
-                        continue;
-                    }
-                    if macro_paused_ws.load(Ordering::Relaxed) {
-                        debug!("Skipping bazaar flip — macro paused: {}", bazaar_flip.item_name);
                         continue;
                     }
 
@@ -3504,12 +3441,6 @@ async fn main() -> Result<()> {
             );
             print_mc_chat(&baf_msg);
             let _ = chat_tx_human.send(baf_msg);
-
-            // Pause the macro BEFORE sending /quit so flip intakes immediately
-            // start dropping incoming recommendations.  Without this, Coflnet
-            // flip/bazaar events that arrive during the break would sit in the
-            // command queue and fire on reconnect.
-            macro_paused_human.store(true, std::sync::atomic::Ordering::Relaxed);
 
             // Disconnect from the server via /quit
             command_queue_human.enqueue(
