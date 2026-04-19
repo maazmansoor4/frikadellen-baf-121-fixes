@@ -166,10 +166,10 @@ impl BazaarOrderTracker {
 
     /// Reconcile the tracker with the orders currently visible in-game.
     ///
-    /// `ingame_orders` is the list of `(item_name, is_buy_order)` tuples taken
-    /// from the Bazaar Orders window during a ManageOrders cycle.  Any tracked
-    /// order whose item+type does **not** appear in this list is removed so the
-    /// web panel stays in sync with the actual in-game state.
+    /// `ingame_orders` is the list of `(item_name, is_buy_order, amount, price_per_unit)`
+    /// tuples taken from the Bazaar Orders window during a ManageOrders cycle.
+    /// Any tracked order whose item+type does **not** appear in this list is
+    /// removed so the web panel stays in sync with the actual in-game state.
     ///
     /// Orders visible in-game but NOT yet tracked (e.g. placed before the bot
     /// started, or placed manually) are added as new entries so the web panel
@@ -180,11 +180,11 @@ impl BazaarOrderTracker {
     /// orders are kept.
     ///
     /// Returns the number of stale tracker entries removed.
-    pub fn reconcile_with_ingame(&self, ingame_orders: &[(String, bool)]) -> usize {
+    pub fn reconcile_with_ingame(&self, ingame_orders: &[(String, bool, u64, f64)]) -> usize {
         // Build a count map: (normalized_name, is_buy) → how many in-game.
         let mut ingame_counts: std::collections::HashMap<(String, bool), usize> =
             std::collections::HashMap::new();
-        for (name, is_buy) in ingame_orders {
+        for (name, is_buy, _, _) in ingame_orders {
             *ingame_counts
                 .entry((normalize_for_match(name), *is_buy))
                 .or_insert(0) += 1;
@@ -209,27 +209,45 @@ impl BazaarOrderTracker {
         let removed = original_len - orders.len();
 
         // Add in-game orders that aren't already tracked.
+        // Iterate over unique keys to avoid duplicate additions.
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
         let mut added = 0usize;
-        for (name, is_buy) in ingame_orders {
-            let key = (normalize_for_match(name), *is_buy);
-            let tracked = kept_counts.get(&key).copied().unwrap_or(0);
-            let needed = ingame_counts.get(&key).copied().unwrap_or(0);
-            if tracked < needed {
+
+        // Build a map from (normalized_name, is_buy) → Vec<(amount, price)>
+        // so we can pick the correct data for each missing order.
+        let mut ingame_data: std::collections::HashMap<(String, bool), Vec<(u64, f64)>> =
+            std::collections::HashMap::new();
+        for (name, is_buy, amount, price) in ingame_orders {
+            ingame_data
+                .entry((normalize_for_match(name), *is_buy))
+                .or_default()
+                .push((*amount, *price));
+        }
+
+        for (key, data_entries) in &ingame_data {
+            let tracked = kept_counts.get(key).copied().unwrap_or(0);
+            let needed = data_entries.len();
+            for idx in tracked..needed {
+                let (amount, price) = data_entries.get(idx).copied().unwrap_or((0, 0.0));
+                // Use title case for the item name from the first matching ingame order
+                let display_name = ingame_orders.iter()
+                    .find(|(n, b, _, _)| normalize_for_match(n) == key.0 && *b == key.1)
+                    .map(|(n, _, _, _)| n.clone())
+                    .unwrap_or_else(|| key.0.clone());
                 orders.push(TrackedBazaarOrder {
-                    item_name: name.clone(),
-                    amount: 0, // unknown at reconciliation time
-                    price_per_unit: 0.0,
-                    is_buy_order: *is_buy,
+                    item_name: display_name,
+                    amount,
+                    price_per_unit: price,
+                    is_buy_order: key.1,
                     status: "open".to_string(),
                     placed_at: now,
                 });
-                *kept_counts.entry(key).or_insert(0) += 1;
                 added += 1;
             }
+            *kept_counts.entry(key.clone()).or_insert(0) = needed;
         }
 
         drop(orders);
@@ -570,8 +588,8 @@ mod tests {
 
         // In-game only has Coal BUY and Diamond SELL — Iron Ingot is stale
         let ingame = vec![
-            ("Coal".to_string(), true),
-            ("Diamond".to_string(), false),
+            ("Coal".to_string(), true, 10, 500.0),
+            ("Diamond".to_string(), false, 5, 1000.0),
         ];
         let removed = tracker.reconcile_with_ingame(&ingame);
         assert_eq!(removed, 1);
@@ -585,7 +603,7 @@ mod tests {
     fn reconcile_case_insensitive() {
         let tracker = BazaarOrderTracker::new_in_memory();
         tracker.add_order("Enchanted Coal Block".into(), 4, 30100.0, false);
-        let ingame = vec![("enchanted coal block".to_string(), false)];
+        let ingame = vec![("enchanted coal block".to_string(), false, 4, 30100.0)];
         let removed = tracker.reconcile_with_ingame(&ingame);
         assert_eq!(removed, 0);
         assert_eq!(tracker.get_orders().len(), 1);
@@ -601,7 +619,7 @@ mod tests {
         assert_eq!(tracker.get_orders().len(), 3);
 
         // In-game only has 1 "Coal" buy order (2 were cancelled externally)
-        let ingame = vec![("Coal".to_string(), true)];
+        let ingame = vec![("Coal".to_string(), true, 10, 500.0)];
         let removed = tracker.reconcile_with_ingame(&ingame);
         assert_eq!(removed, 2);
         assert_eq!(tracker.get_orders().len(), 1);
@@ -618,13 +636,37 @@ mod tests {
 
         // In-game has 2 "Coal" buy orders and 1 "Diamond" sell order
         let ingame = vec![
-            ("Coal".to_string(), true),
-            ("Coal".to_string(), true),
-            ("Diamond".to_string(), false),
+            ("Coal".to_string(), true, 10, 500.0),
+            ("Coal".to_string(), true, 20, 510.0),
+            ("Diamond".to_string(), false, 5, 1000.0),
         ];
         let removed = tracker.reconcile_with_ingame(&ingame);
         assert_eq!(removed, 0);
         assert_eq!(tracker.get_orders().len(), 3);
+    }
+
+    #[test]
+    fn reconcile_adds_new_orders_with_correct_data() {
+        let tracker = BazaarOrderTracker::new_in_memory();
+        // Empty tracker, in-game has 2 orders
+        let ingame = vec![
+            ("Coal".to_string(), true, 64, 500.0),
+            ("Diamond".to_string(), false, 10, 1200.5),
+        ];
+        let removed = tracker.reconcile_with_ingame(&ingame);
+        assert_eq!(removed, 0);
+        let orders = tracker.get_orders();
+        assert_eq!(orders.len(), 2);
+
+        let coal = orders.iter().find(|o| o.item_name == "Coal").unwrap();
+        assert_eq!(coal.amount, 64);
+        assert!((coal.price_per_unit - 500.0).abs() < 0.01);
+        assert!(coal.is_buy_order);
+
+        let diamond = orders.iter().find(|o| o.item_name == "Diamond").unwrap();
+        assert_eq!(diamond.amount, 10);
+        assert!((diamond.price_per_unit - 1200.5).abs() < 0.01);
+        assert!(!diamond.is_buy_order);
     }
 
     #[test]

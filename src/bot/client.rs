@@ -438,10 +438,10 @@ pub enum BotEvent {
         starting_bid: u64,
     },
     /// Reconciliation snapshot: the set of orders visible in the in-game
-    /// Bazaar Orders window.  Each entry is (item_name, is_buy_order).
+    /// Bazaar Orders window.  Each entry is (item_name, is_buy_order, amount, price_per_unit).
     /// The tracker should remove any orders not in this list.
     BazaarOrdersSnapshot {
-        ingame_orders: Vec<(String, bool)>,
+        ingame_orders: Vec<(String, bool, u64, f64)>,
     },
     /// "You cannot view this auction!" was received — no active booster cookie.
     /// The bot cannot function; the user must manually buy a cookie.
@@ -1786,6 +1786,14 @@ fn parse_bed_remaining_secs_from_text(all_text: &str) -> Option<u64> {
     None
 }
 
+/// Check if a lowercased string contains "ended" as a standalone word
+/// (e.g. "auction ended") but NOT as a suffix of another word (e.g.
+/// "recommended", "mended", "befriended").  Uses a regex word boundary.
+fn contains_word_ended(text: &str) -> bool {
+    static RE: Lazy<regex::Regex> = Lazy::new(|| regex::Regex::new(r"\bended\b").unwrap());
+    RE.is_match(text)
+}
+
 /// Returns true if the item is a claimable (sold/ended/expired) auction slot.
 /// Matches TypeScript ingameMessageHandler claimableIndicators / activeIndicators.
 fn is_claimable_auction_slot(item: &azalea_inventory::ItemStack) -> bool {
@@ -1796,7 +1804,7 @@ fn is_claimable_auction_slot(item: &azalea_inventory::ItemStack) -> bool {
     let combined = lore.join("\n").to_lowercase();
     // Must have at least one claimable indicator (from TypeScript claimableIndicators)
     let has_claimable = combined.contains("sold!")
-        || combined.contains("ended")
+        || contains_word_ended(&combined)
         || combined.contains("expired")
         || combined.contains("click to claim")
         || combined.contains("claim your");
@@ -2067,6 +2075,52 @@ fn parse_filled_amount_from_lore(lore: &[String]) -> Option<(u64, u64)> {
                 if let (Ok(filled), Ok(total)) = (filled_str.parse::<u64>(), total_str.parse::<u64>()) {
                     return Some((filled, total));
                 }
+            }
+        }
+    }
+    None
+}
+
+/// Parse the total order amount from Hypixel's order lore.
+///
+/// Lore lines contain `"Order amount: 64x"` (e.g. `"Order amount: 2,560x"`).
+/// Returns the total amount when found.
+fn parse_order_amount_from_lore(lore: &[String]) -> Option<u64> {
+    for line in lore {
+        let clean = remove_mc_colors(line);
+        let lower = clean.to_lowercase();
+        if let Some(idx) = lower.find("order amount:") {
+            let after = &clean[idx + "order amount:".len()..].trim_start();
+            // Strip trailing 'x' and commas, e.g. "2,560x" → "2560"
+            let num_str: String = after.chars()
+                .take_while(|c| c.is_ascii_digit() || *c == ',')
+                .collect::<String>()
+                .replace(',', "");
+            if let Ok(amount) = num_str.parse::<u64>() {
+                return Some(amount);
+            }
+        }
+    }
+    // Fallback: try to extract the total from the Filled line (X/Y → Y)
+    parse_filled_amount_from_lore(lore).map(|(_, total)| total)
+}
+
+/// Parse the price per unit from Hypixel's order lore.
+///
+/// Lore lines contain `"Price per unit: 1,958.0 coins"`.
+/// Returns the price when found.
+fn parse_unit_price_from_lore(lore: &[String]) -> Option<f64> {
+    for line in lore {
+        let clean = remove_mc_colors(line);
+        let lower = clean.to_lowercase();
+        if let Some(idx) = lower.find("price per unit:") {
+            let after = &clean[idx + "price per unit:".len()..].trim_start();
+            let num_str: String = after.chars()
+                .take_while(|c| c.is_ascii_digit() || *c == ',' || *c == '.')
+                .collect::<String>()
+                .replace(',', "");
+            if let Ok(price) = num_str.parse::<f64>() {
+                return Some(price);
             }
         }
     }
@@ -4245,7 +4299,7 @@ async fn handle_window_interaction(
                     let combined_lower = lore.join("\n").to_lowercase();
                     if combined_lower.contains("sold!")
                         || combined_lower.contains("expired")
-                        || combined_lower.contains("ended")
+                        || contains_word_ended(&combined_lower)
                     {
                         continue;
                     }
@@ -4610,8 +4664,8 @@ async fn handle_window_interaction(
                 //   SELL before BUY within each tier.
                 // Priority (cancel mode): SELL first, then BUY (all orders).
                 //
-                // Tuple: (slot, name, identity, order_key, claimable, filled_amount)
-                type OrderEntry = (usize, String, Option<(bool, String)>, String, bool, Option<u64>);
+                // Tuple: (slot, name, identity, order_key, claimable, filled_amount, order_amount, unit_price)
+                type OrderEntry = (usize, String, Option<(bool, String)>, String, bool, Option<u64>, u64, f64);
                 let mut sell_orders: Vec<OrderEntry> = Vec::new();
                 let mut buy_orders: Vec<OrderEntry> = Vec::new();
 
@@ -4631,11 +4685,13 @@ async fn handle_window_interaction(
                             .unwrap_or_else(|| is_buy_bazaar_order_name(&name));
                         let claimable = is_order_claimable_from_lore(&lore);
                         let filled_amount = parse_filled_amount_from_lore(&lore).map(|(f, _)| f);
+                        let order_amount = parse_order_amount_from_lore(&lore).unwrap_or(0);
+                        let unit_price = parse_unit_price_from_lore(&lore).unwrap_or(0.0);
                         let order_key = format!("{}::{}", i, name_key);
                         if is_buy {
-                            buy_orders.push((i, name, identity, order_key, claimable, filled_amount));
+                            buy_orders.push((i, name, identity, order_key, claimable, filled_amount, order_amount, unit_price));
                         } else {
-                            sell_orders.push((i, name, identity, order_key, claimable, filled_amount));
+                            sell_orders.push((i, name, identity, order_key, claimable, filled_amount, order_amount, unit_price));
                         }
                     }
                 }
@@ -4646,12 +4702,12 @@ async fn handle_window_interaction(
                 // stale entries that no longer exist in-game.
                 {
                     let mut ingame_orders = Vec::with_capacity(total_orders);
-                    for (_, name, identity, _, _, _) in sell_orders.iter().chain(buy_orders.iter()) {
+                    for (_, name, identity, _, _, _, order_amount, unit_price) in sell_orders.iter().chain(buy_orders.iter()) {
                         let is_buy = identity.as_ref()
                             .map(|(b, _)| *b)
                             .unwrap_or_else(|| is_buy_bazaar_order_name(name));
                         let clean = clean_order_item_name(name, identity);
-                        ingame_orders.push((clean, is_buy));
+                        ingame_orders.push((clean, is_buy, *order_amount, *unit_price));
                     }
                     let _ = state.event_tx.send(BotEvent::BazaarOrdersSnapshot { ingame_orders });
                 }
@@ -4681,7 +4737,7 @@ async fn handle_window_interaction(
                     // Targeted cancel: find the specific order matching the web GUI request.
                     let tgt_norm = crate::bazaar_tracker::normalize_for_match_pub(tgt_name);
                     let mut all_orders = sell_orders.iter().chain(buy_orders.iter());
-                    all_orders.find(|(_, name, identity, _, _, _)| {
+                    all_orders.find(|(_, name, identity, _, _, _, _, _)| {
                         let order_is_buy = identity.as_ref()
                             .map(|(b, _)| *b)
                             .unwrap_or_else(|| is_buy_bazaar_order_name(name));
@@ -4692,19 +4748,19 @@ async fn handle_window_interaction(
                 } else if !cancel_open {
                     // Always try claimable sell orders first (yield coins, no
                     // inventory space needed).
-                    sell_orders.iter().find(|&(_, _, _, _, claimable, _)| *claimable).cloned()
+                    sell_orders.iter().find(|&(_, _, _, _, claimable, _, _, _)| *claimable).cloned()
                         // Claimable buy orders — skip entirely when inventory is
                         // full so we don't waste a ManageOrders cycle opening /bz,
                         // navigating to the order, and then aborting.
                         .or_else(|| {
                             if inv_full { None } else {
-                                buy_orders.iter().find(|&(_, _, _, _, claimable, _)| *claimable).cloned()
+                                buy_orders.iter().find(|&(_, _, _, _, claimable, _, _, _)| *claimable).cloned()
                             }
                         })
-                        .or_else(|| sell_orders.iter().find(|&(_, _, identity, _, claimable, _)| {
+                        .or_else(|| sell_orders.iter().find(|&(_, _, identity, _, claimable, _, _, _)| {
                             !claimable && should_cancel_open_order_due_to_age(identity.clone(), cancel_mins)
                         }).cloned())
-                        .or_else(|| buy_orders.iter().find(|&(_, _, identity, _, claimable, _)| {
+                        .or_else(|| buy_orders.iter().find(|&(_, _, identity, _, claimable, _, _, _)| {
                             !claimable && should_cancel_open_order_due_to_age(identity.clone(), cancel_mins)
                         }).cloned())
                 } else {
@@ -4722,7 +4778,7 @@ async fn handle_window_interaction(
                         state.bazaar_at_limit.store(false, Ordering::Relaxed);
                         *state.bot_state.write() = BotState::Idle;
                     }
-                    Some((i, order_name, order_identity, _processed_key, _claimable, order_filled_amount)) => {
+                    Some((i, order_name, order_identity, _processed_key, _claimable, order_filled_amount, _, _)) => {
                         let order_is_buy = order_identity.as_ref()
                             .map(|(b, _)| *b)
                             .unwrap_or_else(|| is_buy_bazaar_order_name(&order_name));
@@ -5886,7 +5942,7 @@ fn build_cached_my_auctions_json(slots: &[azalea_inventory::ItemStack], state: &
             || combined_lower.contains("starting bid")
             || combined_lower.contains("sold")
             || combined_lower.contains("expired")
-            || combined_lower.contains("ended")
+            || contains_word_ended(&combined_lower)
             || combined_lower.contains("click to claim");
         if !is_auction_slot {
             continue;
@@ -5895,7 +5951,7 @@ fn build_cached_my_auctions_json(slots: &[azalea_inventory::ItemStack], state: &
         // Determine status
         let status = if combined_lower.contains("sold!") || combined_lower.contains("click to claim") {
             "sold"
-        } else if combined_lower.contains("expired") || combined_lower.contains("ended") {
+        } else if combined_lower.contains("expired") || contains_word_ended(&combined_lower) {
             "expired"
         } else {
             "active"
