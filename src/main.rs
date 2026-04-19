@@ -550,7 +550,8 @@ async fn main() -> Result<()> {
     let cofl_authenticated = Arc::new(AtomicBool::new(false));
 
     // Set once after auto-sending `/cofl license default <ign>` to prevent repeat attempts.
-    let license_default_sent = Arc::new(AtomicBool::new(false));
+    // For single-account setups, skip license management entirely (not needed).
+    let license_default_sent = Arc::new(AtomicBool::new(ingame_names.len() == 1));
 
     // Get or generate session ID for Coflnet (matching TypeScript coflSessionManager.ts)
     let session_id = if let Some(session) = config.sessions.get(&ingame_name) {
@@ -1563,7 +1564,7 @@ async fn main() -> Result<()> {
                         } else {
                             info!("[BazaarOrders] Order filled — queuing ManageOrders");
                             command_queue_clone.enqueue(
-                                frikadellen_baf::types::CommandType::ManageOrders { cancel_open: false },
+                                frikadellen_baf::types::CommandType::ManageOrders { cancel_open: false, target_item: None },
                                 frikadellen_baf::types::CommandPriority::High,
                                 true,
                             );
@@ -1824,7 +1825,7 @@ async fn main() -> Result<()> {
                     if bot_client_for_ws.is_bazaar_at_limit() && !effective_is_buy && !command_queue_clone.has_manage_orders() {
                         info!("[BazaarFlips] At order limit with SELL queued — pre-queuing ManageOrders to free a slot");
                         command_queue_clone.enqueue(
-                            CommandType::ManageOrders { cancel_open: false },
+                            CommandType::ManageOrders { cancel_open: false, target_item: None },
                             CommandPriority::High,
                             false,
                         );
@@ -2076,7 +2077,7 @@ async fn main() -> Result<()> {
                                 if bot_client_for_ws.is_bazaar_at_limit() && !effective_is_buy && !command_queue_clone.has_manage_orders() {
                                     info!("[BazaarFlips] At order limit with SELL queued (chat) — pre-queuing ManageOrders to free a slot");
                                     command_queue_clone.enqueue(
-                                        CommandType::ManageOrders { cancel_open: false },
+                                        CommandType::ManageOrders { cancel_open: false, target_item: None },
                                         CommandPriority::High,
                                         false,
                                     );
@@ -2406,7 +2407,7 @@ async fn main() -> Result<()> {
                             if !command_queue_resume.has_manage_orders() {
                                 info!("[BazaarFlips] Queuing deferred ManageOrders after AH flip window");
                                 command_queue_resume.enqueue(
-                                    CommandType::ManageOrders { cancel_open: false },
+                                    CommandType::ManageOrders { cancel_open: false, target_item: None },
                                     CommandPriority::Normal,
                                     false,
                                 );
@@ -2601,7 +2602,7 @@ async fn main() -> Result<()> {
                         // and free up bazaar order slots.
                         if !command_queue_processor.has_manage_orders() {
                             command_queue_processor.enqueue(
-                                frikadellen_baf::types::CommandType::ManageOrders { cancel_open: false },
+                                frikadellen_baf::types::CommandType::ManageOrders { cancel_open: false, target_item: None },
                                 frikadellen_baf::types::CommandPriority::High,
                                 false,
                             );
@@ -2969,7 +2970,7 @@ async fn main() -> Result<()> {
                 if bot_client_orders.state().allows_commands() && !command_queue_orders.has_manage_orders() {
                     debug!("[BazaarOrders] Periodic order check triggered (every {}s)", order_interval);
                     command_queue_orders.enqueue(
-                        CommandType::ManageOrders { cancel_open: false },
+                        CommandType::ManageOrders { cancel_open: false, target_item: None },
                         CommandPriority::Normal,
                         false,
                     );
@@ -3558,11 +3559,11 @@ mod tests {
         // ManageOrders IS deferred during AH pause — it would block the AH
         // flip purchase.  A new ManageOrders is re-queued when flips resume.
         assert!(should_drop_bazaar_command_during_ah_pause(
-            &CommandType::ManageOrders { cancel_open: false },
+            &CommandType::ManageOrders { cancel_open: false, target_item: None },
             paused,
         ));
         assert!(should_drop_bazaar_command_during_ah_pause(
-            &CommandType::ManageOrders { cancel_open: true },
+            &CommandType::ManageOrders { cancel_open: true, target_item: None },
             paused,
         ));
     }

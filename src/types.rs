@@ -268,8 +268,12 @@ pub enum CommandType {
     /// When `cancel_open` is true (startup), all open orders are cancelled in addition
     /// to collecting filled ones. When false (order-fill triggered), only filled orders
     /// are collected and open orders are left untouched.
+    /// When `target_item` is set, only that specific order is cancelled (used by the
+    /// web GUI's individual cancel button).
     ManageOrders {
         cancel_open: bool,
+        /// When set, only the matching order is cancelled instead of all open orders.
+        target_item: Option<(String, bool)>,
     },
     // Advanced commands matching TypeScript BAF.ts
     ClickSlot {

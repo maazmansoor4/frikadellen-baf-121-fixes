@@ -329,6 +329,8 @@ pub struct BotClient {
     pub ingame_name: Arc<RwLock<String>>,
     /// When true, the ManagingOrders handler also cancels open orders (startup mode).
     manage_orders_cancel_open: Arc<AtomicBool>,
+    /// When set, the ManageOrders handler targets a specific order for cancellation.
+    manage_orders_target_item: Arc<RwLock<Option<(String, bool)>>>,
     /// Cancel open bazaar orders when they are older than this many minutes per million coins.
     /// 0 disables age-based cancellation in periodic ManageOrders runs.
     pub bazaar_order_cancel_minutes_per_million: u64,
@@ -481,6 +483,7 @@ impl BotClient {
             active_auction_listings: Arc::new(RwLock::new(std::collections::HashSet::new())),
             ingame_name: Arc::new(RwLock::new(String::new())),
             manage_orders_cancel_open: Arc::new(AtomicBool::new(false)),
+            manage_orders_target_item: Arc::new(RwLock::new(None)),
             bazaar_order_cancel_minutes_per_million: 5,
             cached_my_auctions_json: Arc::new(RwLock::new(None)),
             purchase_start_time: Arc::new(RwLock::new(None)),
@@ -596,6 +599,7 @@ impl BotClient {
             active_auction_listings: self.active_auction_listings.clone(),
             ingame_name: self.ingame_name.clone(),
             manage_orders_cancel_open: self.manage_orders_cancel_open.clone(),
+            manage_orders_target_item: self.manage_orders_target_item.clone(),
             bazaar_order_cancel_minutes_per_million: self.bazaar_order_cancel_minutes_per_million,
             managing_order_context: Arc::new(RwLock::new(None)),
             cached_my_auctions_json: self.cached_my_auctions_json.clone(),
@@ -849,6 +853,14 @@ impl BotClient {
     /// from expired auctions without triggering an ItemSold event.
     pub fn clear_auction_at_limit(&self) {
         self.auction_at_limit.store(false, Ordering::Relaxed);
+    }
+
+    /// Request the bot to disconnect from Hypixel.
+    /// Sets state to Idle and logs the disconnect — actual TCP teardown happens
+    /// in the bot runtime thread.
+    pub fn disconnect(&self) {
+        info!("[BotClient] Disconnect requested via web GUI");
+        self.set_state(BotState::Idle);
     }
 
     /// Returns true if inventory is full (items stashed / no space to claim).
@@ -1213,6 +1225,10 @@ pub struct BotClientState {
     /// When true, the ManagingOrders handler also cancels open orders (startup mode).
     /// When false, it only collects filled orders and leaves open orders untouched.
     pub manage_orders_cancel_open: Arc<AtomicBool>,
+    /// When set, the ManageOrders handler targets a specific order for cancellation
+    /// instead of processing all orders.  Format: `(item_name, is_buy_order)`.
+    /// Cleared at the start of each ManageOrders command.
+    pub manage_orders_target_item: Arc<RwLock<Option<(String, bool)>>>,
     /// Cancel open bazaar orders when they are older than this many minutes per million coins.
     /// 0 disables age-based cancellation in periodic ManageOrders runs.
     pub bazaar_order_cancel_minutes_per_million: u64,
@@ -1338,6 +1354,7 @@ impl Default for BotClientState {
             active_auction_listings: Arc::new(RwLock::new(std::collections::HashSet::new())),
             ingame_name: Arc::new(RwLock::new(String::new())),
             manage_orders_cancel_open: Arc::new(AtomicBool::new(false)),
+            manage_orders_target_item: Arc::new(RwLock::new(None)),
             bazaar_order_cancel_minutes_per_million: 5,
             managing_order_context: Arc::new(RwLock::new(None)),
             cached_my_auctions_json: Arc::new(RwLock::new(None)),
@@ -3272,9 +3289,13 @@ async fn execute_command(
             send_chat_command(bot, "/sbmenu");
             *state.bot_state.write() = BotState::CheckingCookie;
         }
-        CommandType::ManageOrders { cancel_open } => {
+        CommandType::ManageOrders { cancel_open, target_item } => {
             let mode = if *cancel_open { "startup (cancel+collect)" } else { "collect-only" };
             info!("[ManageOrders] Triggered ({}) — opening /bz", mode);
+            if let Some((ref name, is_buy)) = target_item {
+                let side = if *is_buy { "BUY" } else { "SELL" };
+                info!("[ManageOrders] Targeting specific order: {} ({})", name, side);
+            }
             *state.manage_orders_cancelled.write() = 0;
             // NOTE: inventory_full is intentionally NOT cleared here.  Clearing
             // it caused a tight loop where ManageOrders would reset the flag,
@@ -3285,6 +3306,7 @@ async fn execute_command(
             // This lets ManageOrders skip BUY orders when the flag is set while
             // still collecting SELL orders (which yield coins, not items).
             state.manage_orders_cancel_open.store(*cancel_open, Ordering::Relaxed);
+            *state.manage_orders_target_item.write() = target_item.clone();
             state.manage_orders_processed.write().clear();
             // Do NOT clear order_cancel_failures here — let failures accumulate
             // across ManageOrders cycles so MAX_CANCEL_RETRIES actually works.
@@ -4055,14 +4077,14 @@ async fn handle_window_interaction(
                     found = true;
                 }
                 if !found {
-                    // Look for purchased item with "Status: Sold!" in lore (TypeScript pattern)
+                    // Look for a claimable purchased item using the same
+                    // indicators as ClaimingSold (sold!, ended, expired,
+                    // click to claim, claim your) — not just "Status: Sold".
                     // Only scan window slots, not player inventory.
                     let window_slot_count = window_content_slot_count(slots.len());
                     for (i, item) in slots.iter().enumerate().take(window_slot_count) {
-                        let lore = get_item_lore_from_slot(item);
-                        let lore_lower = lore.join("\n").to_lowercase();
-                        if lore_lower.contains("status:") && lore_lower.contains("sold") {
-                            info!("[ClaimPurchased] Found purchased item with Sold status at slot {}", i);
+                        if is_claimable_auction_slot(item) {
+                            info!("[ClaimPurchased] Found claimable item at slot {}", i);
                             click_window_slot(bot, &state.last_window_id, window_id, i as i16).await;
                             // Stay in ClaimingPurchased — next window should be BIN Auction View
                             found = true;
@@ -4556,6 +4578,7 @@ async fn handle_window_interaction(
             }
 
             let cancel_open = state.manage_orders_cancel_open.load(Ordering::Relaxed);
+            let target_item = state.manage_orders_target_item.read().clone();
             if window_title.contains("Bazaar") && !is_bazaar_orders_window_title(window_title) {
                 // Bazaar page (main or category) — find "Manage Orders" button
                 // dynamically.  Hypixel may rearrange slots across updates, so we
@@ -4654,7 +4677,19 @@ async fn handle_window_interaction(
                         inv_full = false;
                     }
                 }
-                let chosen_order: Option<OrderEntry> = if !cancel_open {
+                let chosen_order: Option<OrderEntry> = if let Some((ref tgt_name, tgt_is_buy)) = target_item {
+                    // Targeted cancel: find the specific order matching the web GUI request.
+                    let tgt_norm = crate::bazaar_tracker::normalize_for_match_pub(tgt_name);
+                    let mut all_orders = sell_orders.iter().chain(buy_orders.iter());
+                    all_orders.find(|(_, name, identity, _, _, _)| {
+                        let order_is_buy = identity.as_ref()
+                            .map(|(b, _)| *b)
+                            .unwrap_or_else(|| is_buy_bazaar_order_name(name));
+                        if order_is_buy != tgt_is_buy { return false; }
+                        let clean = clean_order_item_name(name, identity);
+                        crate::bazaar_tracker::normalize_for_match_pub(&clean) == tgt_norm
+                    }).cloned()
+                } else if !cancel_open {
                     // Always try claimable sell orders first (yield coins, no
                     // inventory space needed).
                     sell_orders.iter().find(|&(_, _, _, _, claimable, _)| *claimable).cloned()
@@ -4803,10 +4838,10 @@ async fn handle_window_interaction(
                         // because that handler is still active.
                         if total_orders > 1 && !order_options_opened {
                             if let Some(queue) = state.command_queue.read().as_ref() {
-                                if !queue.has_manage_orders() {
+                                if !queue.has_manage_orders() && target_item.is_none() {
                                     info!("[ManageOrders] {} more order(s) remain — re-queuing ManageOrders", total_orders - 1);
                                     queue.enqueue(
-                                        crate::types::CommandType::ManageOrders { cancel_open },
+                                        crate::types::CommandType::ManageOrders { cancel_open, target_item: None },
                                         crate::types::CommandPriority::Normal,
                                         false,
                                     );
@@ -4950,7 +4985,7 @@ async fn handle_window_interaction(
                             if !queue.has_manage_orders() {
                                 info!("[ManageOrders] Re-queuing ManageOrders after partial collect in Order options");
                                 queue.enqueue(
-                                    crate::types::CommandType::ManageOrders { cancel_open },
+                                    crate::types::CommandType::ManageOrders { cancel_open, target_item: None },
                                     crate::types::CommandPriority::Normal,
                                     false,
                                 );
@@ -5090,7 +5125,7 @@ async fn handle_window_interaction(
                     if !queue.has_manage_orders() {
                         info!("[ManageOrders] Re-queuing ManageOrders after Order options (cancel/collect)");
                         queue.enqueue(
-                            crate::types::CommandType::ManageOrders { cancel_open },
+                            crate::types::CommandType::ManageOrders { cancel_open, target_item: None },
                             crate::types::CommandPriority::Normal,
                             false,
                         );
@@ -6552,7 +6587,7 @@ async fn run_startup_workflow(
     await_queued_command(
         &queue,
         &bot_state,
-        CommandType::ManageOrders { cancel_open },
+        CommandType::ManageOrders { cancel_open, target_item: None },
         50,
     ).await;
     let orders_cancelled = *manage_orders_cancelled.read();

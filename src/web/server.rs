@@ -284,6 +284,9 @@ pub async fn start_web_server(state: WebSharedState, port: u16) {
         .route("/api/config", get(get_config).post(save_config))
         .route("/api/logs/latest", get(download_latest_log))
         .route("/api/profit", get(get_profit))
+        .route("/api/kill_session", axum::routing::post(kill_session))
+        .route("/api/disconnect", axum::routing::post(disconnect_session))
+        .route("/api/connect", axum::routing::post(connect_session))
         .layer(axum::middleware::from_fn(move |req: Request, next: Next| {
             let s = auth_state.clone();
             async move { check_auth(s, req, next).await }
@@ -585,7 +588,7 @@ async fn process_chat_input(input: &str, state: &WebSharedState) {
             CommandType::SendChat {
                 message: input.to_string(),
             },
-            CommandPriority::High,
+            CommandPriority::Critical,
             false,
         );
     } else {
@@ -687,7 +690,7 @@ async fn cancel_auction(
             item_name: payload.item_name,
             starting_bid: payload.starting_bid,
         },
-        CommandPriority::High,
+        CommandPriority::Critical,
         false,
     );
 
@@ -705,7 +708,7 @@ async fn claim_purchases(
 
     s.command_queue.enqueue(
         CommandType::ClaimPurchasedItem,
-        CommandPriority::High,
+        CommandPriority::Critical,
         false,
     );
 
@@ -723,7 +726,7 @@ async fn collect_bz_orders(
 
     s.command_queue.enqueue(
         CommandType::SellInventoryBz,
-        CommandPriority::High,
+        CommandPriority::Critical,
         false,
     );
 
@@ -740,8 +743,8 @@ async fn claim_bz_orders(
     let _ = s.chat_tx.send(msg);
 
     s.command_queue.enqueue(
-        CommandType::ManageOrders { cancel_open: false },
-        CommandPriority::High,
+        CommandType::ManageOrders { cancel_open: false, target_item: None },
+        CommandPriority::Critical,
         false,
     );
 
@@ -767,12 +770,15 @@ async fn cancel_bz_order(
 
     // Remove the order from the tracker immediately so the web GUI reflects
     // the intent.  The in-game cancellation happens asynchronously via
-    // ManageOrders and will fire BazaarOrderCancelled on success.
+    // ManageOrders targeting this specific order.
     s.bazaar_tracker.remove_order(&payload.item_name, payload.is_buy_order);
 
     s.command_queue.enqueue(
-        CommandType::ManageOrders { cancel_open: true },
-        CommandPriority::High,
+        CommandType::ManageOrders {
+            cancel_open: true,
+            target_item: Some((payload.item_name, payload.is_buy_order)),
+        },
+        CommandPriority::Critical,
         false,
     );
 
@@ -794,12 +800,60 @@ async fn cancel_all_bz_orders(
 
     // Queue a ManageOrders cycle with cancel_open=true to cancel in-game orders.
     s.command_queue.enqueue(
-        CommandType::ManageOrders { cancel_open: true },
-        CommandPriority::High,
+        CommandType::ManageOrders { cancel_open: true, target_item: None },
+        CommandPriority::Critical,
         false,
     );
 
     (StatusCode::OK, "Cancel all bazaar orders command queued")
+}
+
+// ── Session control ───────────────────────────────────────────
+
+async fn kill_session() -> impl IntoResponse {
+    info!("[WebGUI] Kill session requested — terminating process");
+    // Spawn so the HTTP response is sent before exit
+    tokio::spawn(async {
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        std::process::exit(0);
+    });
+    (StatusCode::OK, "Killing session — process will terminate")
+}
+
+async fn disconnect_session(State(s): State<WebSharedState>) -> impl IntoResponse {
+    info!("[WebGUI] Disconnect requested");
+
+    let msg = "[BAF Web] Disconnecting from Hypixel and COFL...".to_string();
+    print_mc_chat(&msg);
+    let _ = s.chat_tx.send(msg);
+
+    // Close the COFL websocket
+    let ws = s.ws_client.clone();
+    tokio::spawn(async move {
+        if let Err(e) = ws.close().await {
+            warn!("[WebGUI] Failed to close COFL websocket: {}", e);
+        }
+    });
+
+    // Disconnect the bot from Hypixel
+    s.bot_client.disconnect();
+
+    (StatusCode::OK, "Disconnected from Hypixel and COFL")
+}
+
+async fn connect_session(State(s): State<WebSharedState>) -> impl IntoResponse {
+    info!("[WebGUI] Reconnect requested — restarting process");
+
+    let msg = "[BAF Web] Reconnecting — restarting process...".to_string();
+    let _ = s.chat_tx.send(msg);
+
+    // Restart the process to reconnect everything cleanly
+    tokio::spawn(async {
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        crate::utils::restart_process();
+    });
+
+    (StatusCode::OK, "Reconnecting — process will restart")
 }
 
 // ── Active auctions ───────────────────────────────────────────
