@@ -551,7 +551,7 @@ async fn main() -> Result<()> {
 
     // Set once after auto-sending `/cofl license default <ign>` to prevent repeat attempts.
     // For single-account setups, skip license management entirely (not needed).
-    let license_default_sent = Arc::new(AtomicBool::new(ingame_names.len() <= 1));
+    let license_default_sent = Arc::new(AtomicBool::new(ingame_names.len() == 1));
 
     // Get or generate session ID for Coflnet (matching TypeScript coflSessionManager.ts)
     let session_id = if let Some(session) = config.sessions.get(&ingame_name) {
