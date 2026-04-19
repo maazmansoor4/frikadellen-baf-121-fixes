@@ -740,7 +740,7 @@ async fn claim_bz_orders(
     let _ = s.chat_tx.send(msg);
 
     s.command_queue.enqueue(
-        CommandType::ManageOrders { cancel_open: false },
+        CommandType::ManageOrders { cancel_open: false, target_item: None },
         CommandPriority::High,
         false,
     );
@@ -767,11 +767,14 @@ async fn cancel_bz_order(
 
     // Remove the order from the tracker immediately so the web GUI reflects
     // the intent.  The in-game cancellation happens asynchronously via
-    // ManageOrders and will fire BazaarOrderCancelled on success.
+    // ManageOrders targeting this specific order.
     s.bazaar_tracker.remove_order(&payload.item_name, payload.is_buy_order);
 
     s.command_queue.enqueue(
-        CommandType::ManageOrders { cancel_open: true },
+        CommandType::ManageOrders {
+            cancel_open: true,
+            target_item: Some((payload.item_name, payload.is_buy_order)),
+        },
         CommandPriority::High,
         false,
     );
@@ -794,7 +797,7 @@ async fn cancel_all_bz_orders(
 
     // Queue a ManageOrders cycle with cancel_open=true to cancel in-game orders.
     s.command_queue.enqueue(
-        CommandType::ManageOrders { cancel_open: true },
+        CommandType::ManageOrders { cancel_open: true, target_item: None },
         CommandPriority::High,
         false,
     );

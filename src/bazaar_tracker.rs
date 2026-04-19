@@ -348,6 +348,11 @@ fn normalize_for_match(name: &str) -> String {
     name.to_lowercase().trim().to_string()
 }
 
+/// Public wrapper for `normalize_for_match` — used by `ManageOrders` targeted cancel.
+pub fn normalize_for_match_pub(name: &str) -> String {
+    normalize_for_match(name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

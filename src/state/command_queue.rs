@@ -363,7 +363,7 @@ mod tests {
     }
 
     fn dummy_manage_orders() -> CommandType {
-        CommandType::ManageOrders { cancel_open: false }
+        CommandType::ManageOrders { cancel_open: false, target_item: None }
     }
 
     #[test]
