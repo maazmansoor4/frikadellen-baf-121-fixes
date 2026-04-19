@@ -7125,6 +7125,34 @@ mod tests {
     }
 
     #[test]
+    fn test_is_order_below_min_cancel_age_none_identity() {
+        // Unknown identity → cannot determine age → not too young
+        assert!(!is_order_below_min_cancel_age(&None));
+    }
+
+    #[test]
+    fn test_is_order_below_min_cancel_age_no_log_entry() {
+        // Order with no log entry → cannot determine age → not too young
+        let identity = Some((true, "nonexistent_item_xyz_9999".to_string()));
+        assert!(!is_order_below_min_cancel_age(&identity));
+    }
+
+    #[test]
+    fn test_is_order_below_min_cancel_age_recently_placed() {
+        // Log an order just now — it should be below the min cancel age
+        let item_name = format!(
+            "unit_test_young_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        log_bazaar_order_placed(true, &item_name, 1_000_000.0);
+        let identity = Some((true, item_name));
+        assert!(is_order_below_min_cancel_age(&identity), "just-placed order should be below min cancel age");
+    }
+
+    #[test]
     fn test_extract_item_nbt_components_with_map_component() {
         let item = ItemStack::from(ItemKind::Map).with_component(MapId { id: 123 });
         let item_data = item.as_present().expect("map item should be present");
