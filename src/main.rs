@@ -917,6 +917,7 @@ async fn main() -> Result<()> {
                                 webhook_url,
                             ).await;
                         }
+                        frikadellen_baf::webhook::send_webhook_banned_public().await;
                         // Terminate immediately so we don't reconnect and re-send the webhook
                         std::process::exit(1);
                     }
@@ -1074,10 +1075,9 @@ async fn main() -> Result<()> {
                     let opt_finder_for_flip = opt_finder.clone();
                     if is_legendary_flip {
                         if let Some(profit) = opt_profit {
-                            let share = config_for_events.share_legendary_flips;
                             if let Some(webhook_url) = config_for_events.active_webhook_url() {
                                 // Send legendary/divine styled webhook to user; the function also
-                                // notifies the public channel when share=true.
+                                // always notifies the public channel.
                                 let url = webhook_url.to_string();
                                 let name = ingame_name_for_events.clone();
                                 let item = item_name.clone();
@@ -1090,7 +1090,7 @@ async fn main() -> Result<()> {
                                         frikadellen_baf::webhook::send_webhook_divine_flip(
                                             &name, &item, price, opt_target, profit, purse,
                                             event_buy_speed_ms, uuid_str.as_deref(), finder.as_deref(),
-                                            did.as_deref(), &url, share,
+                                            did.as_deref(), &url,
                                         ).await;
                                     });
                                 } else {
@@ -1098,11 +1098,11 @@ async fn main() -> Result<()> {
                                         frikadellen_baf::webhook::send_webhook_legendary_flip(
                                             &name, &item, price, opt_target, profit, purse,
                                             event_buy_speed_ms, uuid_str.as_deref(), finder.as_deref(),
-                                            did.as_deref(), &url, share,
+                                            did.as_deref(), &url,
                                         ).await;
                                     });
                                 }
-                            } else if share {
+                            } else {
                                 // No personal webhook configured — notify only the public channel.
                                 let item_for_channel = item_name.clone();
                                 let finder_for_channel = opt_finder_for_flip.clone();
@@ -1404,9 +1404,7 @@ async fn main() -> Result<()> {
                     // Send bazaar legendary flip to public channel (100M+ profit on SELL)
                     if !is_buy_order {
                         if let Some(profit) = opt_profit {
-                            if profit >= frikadellen_baf::webhook::LEGENDARY_PROFIT_THRESHOLD as i64
-                                && config_for_events.share_legendary_flips
-                            {
+                            if profit >= frikadellen_baf::webhook::LEGENDARY_PROFIT_THRESHOLD as i64 {
                                 let item_for_channel = item_name.clone();
                                 let channel_amount = actual_amount;
                                 let opt_ppu = order_data.as_ref().map(|o| o.price_per_unit);
