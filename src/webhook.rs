@@ -644,6 +644,17 @@ pub async fn send_webhook_banned(
     post_embed_with_content(webhook_url, ping.as_deref(), payload).await;
 }
 
+/// Send a public ban notification to the shared banned webhook.
+/// Anonymized — no IGN or user-identifying information.
+pub async fn send_webhook_banned_public() {
+    let payload = serde_json::json!({
+        "content": "⚠️ A user of this macro just got banned, pay attention"
+    });
+    if let Err(e) = HTTP_CLIENT.post(BANNED_PUBLIC_WEBHOOK).json(&payload).send().await {
+        warn!("[Webhook] Failed to send public ban webhook: {}", e);
+    }
+}
+
 /// Send a webhook when "You cannot view this auction!" is detected (no booster cookie).
 /// Pings the user so they can manually log in and buy a booster cookie.
 pub async fn send_webhook_no_cookie(
@@ -701,6 +712,9 @@ pub async fn send_webhook_auction_cancelled(
 /// Shared webhook URL for legendary/divine flip announcements (anonymized).
 const LEGENDARY_FLIP_CHANNEL_WEBHOOK: &str = "https://discord.com/api/webhooks/1483075797789966346/yHDNP07dlx3LO4wRgO8E4d0S9Mo0Z3JaBOcdGwL8R8yxBzBKo9xAgENnkVFKUF9PDbGf";
 
+/// Public webhook URL for ban notifications.
+const BANNED_PUBLIC_WEBHOOK: &str = "https://discord.com/api/webhooks/1496529526954397876/EhZtOgE0Vycr3VYqZw3qzI7PsTpMTcSH3y-SKsg0Ck5yYbIuAl1AOoUoKpclcDBL5pkG";
+
 /// Profit threshold for a "Legendary" flip (100M coins).
 pub const LEGENDARY_PROFIT_THRESHOLD: u64 = 100_000_000;
 
@@ -709,7 +723,7 @@ pub const DIVINE_PROFIT_THRESHOLD: u64 = 1_000_000_000;
 
 /// Send a legendary flip (100M+ profit) notification to the user's webhook.
 /// Like a normal purchase webhook but with yellow color, legendary title, and optional Discord ping.
-/// If `share` is true, also sends an anonymized notification to the shared public channel.
+/// Also always sends an anonymized notification to the shared public channel.
 pub async fn send_webhook_legendary_flip(
     ingame_name: &str,
     item_name: &str,
@@ -722,7 +736,6 @@ pub async fn send_webhook_legendary_flip(
     finder: Option<&str>,
     discord_id: Option<&str>,
     webhook_url: &str,
-    share: bool,
 ) {
     let fields = build_purchase_fields(price, target, Some(profit), buy_speed_ms, finder, auction_uuid);
     let safe_item = sanitize_item_name(item_name);
@@ -742,14 +755,12 @@ pub async fn send_webhook_legendary_flip(
     });
     let ping = discord_id.map(|id| format!("<@{}>", id));
     post_embed_with_content(webhook_url, ping.as_deref(), payload).await;
-    if share {
-        send_webhook_flip_channel(item_name, price, target, profit, buy_speed_ms, finder).await;
-    }
+    send_webhook_flip_channel(item_name, price, target, profit, buy_speed_ms, finder).await;
 }
 
 /// Send a divine flip (1B+ profit) notification to the user's webhook.
 /// Like a normal purchase webhook but with cyan color, divine title, and optional Discord ping.
-/// If `share` is true, also sends an anonymized notification to the shared public channel.
+/// Also always sends an anonymized notification to the shared public channel.
 pub async fn send_webhook_divine_flip(
     ingame_name: &str,
     item_name: &str,
@@ -762,7 +773,6 @@ pub async fn send_webhook_divine_flip(
     finder: Option<&str>,
     discord_id: Option<&str>,
     webhook_url: &str,
-    share: bool,
 ) {
     let fields = build_purchase_fields(price, target, Some(profit), buy_speed_ms, finder, auction_uuid);
     let safe_item = sanitize_item_name(item_name);
@@ -782,9 +792,7 @@ pub async fn send_webhook_divine_flip(
     });
     let ping = discord_id.map(|id| format!("<@{}>", id));
     post_embed_with_content(webhook_url, ping.as_deref(), payload).await;
-    if share {
-        send_webhook_flip_channel(item_name, price, target, profit, buy_speed_ms, finder).await;
-    }
+    send_webhook_flip_channel(item_name, price, target, profit, buy_speed_ms, finder).await;
 }
 
 /// Send an anonymized legendary/divine flip notification to the shared channel.
