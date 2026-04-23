@@ -39,6 +39,13 @@ pub struct WebSharedState {
     pub macro_paused: Arc<AtomicBool>,
     pub enable_ah_flips: Arc<AtomicBool>,
     pub enable_bazaar_flips: Arc<AtomicBool>,
+    /// Transient pause flag set by the Disconnect button.  While `true`, the
+    /// COFL WS event loop in `main.rs` drops incoming AH/Bazaar flips instead
+    /// of queueing them.  This is intentionally separate from the config
+    /// `enable_*_flips` atomics (which represent the user's persistent config
+    /// preference and are expected to stay `true`).  Cleared by the Connect
+    /// button and reset by a full process restart.
+    pub flip_intake_paused: Arc<AtomicBool>,
     /// Account names from config (may be single or multi).
     pub ingame_names: Vec<String>,
     pub current_account_index: usize,
@@ -827,8 +834,15 @@ async fn disconnect_session(State(s): State<WebSharedState>) -> impl IntoRespons
     // instead of queueing them. Without this, the bot would keep accepting
     // flips via the COFL WS (which auto-reconnects) while the user thinks
     // it's disconnected.
-    s.enable_ah_flips.store(false, Ordering::Relaxed);
-    s.enable_bazaar_flips.store(false, Ordering::Relaxed);
+    //
+    // NOTE: We use a dedicated `flip_intake_paused` flag here instead of
+    // flipping `enable_ah_flips` / `enable_bazaar_flips`.  Those atomics
+    // represent the user's persistent config preference and are expected to
+    // remain `true` across the process lifetime (see main.rs).  Previously
+    // this code cleared those atomics, which permanently disabled flips
+    // after a single Disconnect click because the COFL WS auto-reconnects
+    // and nothing restored them until a full process restart.
+    s.flip_intake_paused.store(true, Ordering::Relaxed);
 
     // Clear any already-queued flips/orders so they don't fire after the
     // user pressed Disconnect.
@@ -855,11 +869,10 @@ async fn disconnect_session(State(s): State<WebSharedState>) -> impl IntoRespons
 async fn connect_session(State(s): State<WebSharedState>) -> impl IntoResponse {
     info!("[WebGUI] Reconnect requested — restarting process");
 
-    // Safety net: re-enable flip intake in case the restart is skipped or
-    // delayed for any reason. The restart itself re-reads config which is
-    // the authoritative source.
-    s.enable_ah_flips.store(true, Ordering::Relaxed);
-    s.enable_bazaar_flips.store(true, Ordering::Relaxed);
+    // Safety net: clear the flip-intake pause in case the restart is skipped
+    // or delayed for any reason. The restart itself re-creates the atomic
+    // fresh (defaulting to unpaused), which is the authoritative reset.
+    s.flip_intake_paused.store(false, Ordering::Relaxed);
 
     let msg = "[BAF Web] Reconnecting — restarting process...".to_string();
     let _ = s.chat_tx.send(msg);
