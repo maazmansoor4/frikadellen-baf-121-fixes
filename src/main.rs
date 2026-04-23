@@ -520,6 +520,10 @@ async fn main() -> Result<()> {
     // internal code paths that check them.
     let enable_ah_flips = Arc::new(AtomicBool::new(true));
     let enable_bazaar_flips = Arc::new(AtomicBool::new(true));
+    // Transient pause flag flipped by the web panel's Disconnect button.
+    // When true the COFL WS event loop below drops incoming flips instead
+    // of queueing them.  Cleared by the Connect button (or process restart).
+    let flip_intake_paused = Arc::new(AtomicBool::new(false));
     let anonymize_webhook_name = Arc::new(AtomicBool::new(false));
 
     // Broadcast channel for chat messages → web panel clients.
@@ -668,6 +672,7 @@ async fn main() -> Result<()> {
             macro_paused: macro_paused.clone(),
             enable_ah_flips: enable_ah_flips.clone(),
             enable_bazaar_flips: enable_bazaar_flips.clone(),
+            flip_intake_paused: flip_intake_paused.clone(),
             ingame_names: ingame_names.clone(),
             current_account_index,
             account_index_path: account_index_path.clone(),
@@ -1607,6 +1612,7 @@ async fn main() -> Result<()> {
     let cofl_premium_ws = cofl_premium.clone();
     let enable_ah_flips_ws = enable_ah_flips.clone();
     let enable_bazaar_flips_ws = enable_bazaar_flips.clone();
+    let flip_intake_paused_ws = flip_intake_paused.clone();
     let chat_tx_ws = chat_tx.clone();
     let detected_cofl_license_ws = detected_cofl_license.clone();
     let cofl_authenticated_ws = cofl_authenticated.clone();
@@ -1634,6 +1640,12 @@ async fn main() -> Result<()> {
                 CoflEvent::AuctionFlip(flip) => {
                     // Skip if AH flips are disabled
                     if !enable_ah_flips_ws.load(Ordering::Relaxed) {
+                        continue;
+                    }
+
+                    // Skip if the web panel's Disconnect button paused intake.
+                    if flip_intake_paused_ws.load(Ordering::Relaxed) {
+                        debug!("Skipping AH flip — intake paused (Disconnect): {}", flip.item_name);
                         continue;
                     }
 
@@ -1697,6 +1709,12 @@ async fn main() -> Result<()> {
                 CoflEvent::BazaarFlip(bazaar_flip) => {
                     // Skip if bazaar flips are disabled
                     if !enable_bazaar_flips_ws.load(Ordering::Relaxed) {
+                        continue;
+                    }
+
+                    // Skip if the web panel's Disconnect button paused intake.
+                    if flip_intake_paused_ws.load(Ordering::Relaxed) {
+                        debug!("Skipping bazaar flip — intake paused (Disconnect): {}", bazaar_flip.item_name);
                         continue;
                     }
 
@@ -2006,6 +2024,7 @@ async fn main() -> Result<()> {
                     if enable_bazaar_flips_ws.load(Ordering::Relaxed)
                         && cofl_authenticated_ws.load(Ordering::Relaxed)
                         && !bazaar_flips_paused_ws.load(Ordering::Relaxed)
+                        && !flip_intake_paused_ws.load(Ordering::Relaxed)
                     {
                         if let Ok(Some(rec)) = frikadellen_baf::handlers::BazaarFlipHandler::parse_bazaar_flip_message(&msg) {
                             let bot_state = bot_client_for_ws.state();
