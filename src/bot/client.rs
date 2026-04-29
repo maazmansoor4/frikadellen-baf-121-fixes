@@ -367,6 +367,9 @@ pub struct BotClient {
     /// Ensures the dedicated command processor is only spawned once, using the
     /// first live Azalea `Client` handle delivered to `event_handler`.
     command_processor_started: Arc<AtomicBool>,
+    /// Set to true to request a clean disconnect from Hypixel.
+    /// The command processor polls this flag and calls `bot.disconnect()` when set.
+    disconnect_requested: Arc<AtomicBool>,
 }
 #[derive(Debug, Clone)]
 pub enum BotEvent {
@@ -496,6 +499,7 @@ impl BotClient {
             startup_in_progress: Arc::new(AtomicBool::new(false)),
             enable_bazaar_flips: Arc::new(AtomicBool::new(true)),
             command_processor_started: Arc::new(AtomicBool::new(false)),
+            disconnect_requested: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -617,6 +621,7 @@ impl BotClient {
             enable_bazaar_flips: self.enable_bazaar_flips.clone(),
             order_cancel_failures: Arc::new(RwLock::new(HashMap::new())),
             command_processor_started: self.command_processor_started.clone(),
+            disconnect_requested: self.disconnect_requested.clone(),
         };
         
         // Build and start the client (this blocks until disconnection)
@@ -861,6 +866,15 @@ impl BotClient {
     pub fn disconnect(&self) {
         info!("[BotClient] Disconnect requested via web GUI");
         self.set_state(BotState::Idle);
+    }
+
+    /// Request a clean TCP-level disconnect from the Hypixel server.
+    /// Sets the `disconnect_requested` flag that the command-processor loop
+    /// watches; the loop then calls `bot.disconnect()` on the live Azalea
+    /// `Client`, which tears down the TCP connection.
+    pub fn request_disconnect(&self) {
+        info!("[BotClient] Requesting Azalea disconnect");
+        self.disconnect_requested.store(true, Ordering::Release);
     }
 
     /// Returns true if inventory is full (items stashed / no space to claim).
@@ -1288,6 +1302,9 @@ pub struct BotClientState {
     pub order_cancel_failures: Arc<RwLock<HashMap<String, u32>>>,
     /// Ensures the dedicated command processor is only spawned once.
     pub command_processor_started: Arc<AtomicBool>,
+    /// Set to true to request a clean disconnect from Hypixel.
+    /// The command processor polls this flag and calls `bot.disconnect()` when set.
+    pub disconnect_requested: Arc<AtomicBool>,
 }
 
 impl Default for BotClientState {
@@ -1372,6 +1389,7 @@ impl Default for BotClientState {
             enable_bazaar_flips: Arc::new(AtomicBool::new(true)),
             order_cancel_failures: Arc::new(RwLock::new(HashMap::new())),
             command_processor_started: Arc::new(AtomicBool::new(false)),
+            disconnect_requested: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -3118,6 +3136,19 @@ async fn event_handler(
     Ok(())
 }
 
+/// If `disconnect_requested` is set, clears it, calls `bot.disconnect()`, and returns `true`.
+/// The caller should return immediately when this returns `true`.
+fn handle_disconnect_if_requested(bot: &Client, state: &BotClientState) -> bool {
+    if state.disconnect_requested.load(Ordering::Acquire) {
+        info!("[CommandProcessor] Disconnect requested — calling bot.disconnect()");
+        state.disconnect_requested.store(false, Ordering::Release);
+        bot.disconnect();
+        true
+    } else {
+        false
+    }
+}
+
 /// Process queued bot commands independently from the Azalea event stream.
 ///
 /// Previously commands were only drained opportunistically from `event_handler`,
@@ -3125,17 +3156,36 @@ async fn event_handler(
 /// This dedicated loop removes that extra scheduling jitter.
 async fn command_processor(bot: Client, state: BotClientState) {
     loop {
+        // Check for a pending disconnect request before waiting for the next command.
+        if handle_disconnect_if_requested(&bot, &state) {
+            return;
+        }
+
         let command = {
             let mut command_rx = state.command_rx.lock().await;
-            command_rx.recv().await
+            // Use a short timeout so we can re-check disconnect_requested periodically.
+            tokio::time::timeout(
+                tokio::time::Duration::from_millis(200),
+                command_rx.recv(),
+            )
+            .await
         };
 
-        let Some(command) = command else {
-            debug!("Bot command channel closed; stopping command processor");
-            break;
-        };
-
-        execute_command(&bot, &command, &state).await;
+        match command {
+            // Timeout — loop back and re-check disconnect_requested.
+            Err(_elapsed) => continue,
+            Ok(None) => {
+                debug!("Bot command channel closed; stopping command processor");
+                break;
+            }
+            Ok(Some(cmd)) => {
+                // Re-check disconnect flag; don't execute more commands if we're about to disconnect.
+                if handle_disconnect_if_requested(&bot, &state) {
+                    return;
+                }
+                execute_command(&bot, &cmd, &state).await;
+            }
+        }
     }
 }
 

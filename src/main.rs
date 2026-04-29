@@ -121,6 +121,40 @@ fn is_ban_disconnect(reason: &str) -> bool {
         || lower.contains("block id:")
 }
 
+/// Check whether the web GUI port is allowed through UFW.
+/// Prints a prominent warning when UFW is active but the port is not listed.
+/// No-ops silently if UFW is not installed or the check fails.
+#[cfg(target_os = "linux")]
+fn check_ufw_port(port: u16) {
+    use std::process::Command;
+    // Run `ufw status` and capture stdout.
+    let output = match Command::new("ufw").arg("status").output() {
+        Ok(o) => o,
+        Err(_) => return, // UFW not installed — nothing to warn about.
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    // If UFW is inactive, the port will be reachable regardless — no warning needed.
+    if text.contains("Status: inactive") {
+        return;
+    }
+    // Check if the port appears in the UFW rules using exact token matching.
+    // UFW formats rules as "<port>" or "<port>/tcp" or "<port>/udp" at the start of a rule line.
+    // We split by whitespace to avoid e.g. port 80 matching "8080".
+    let port_str = port.to_string();
+    let port_tcp = format!("{}/tcp", port);
+    let port_udp = format!("{}/udp", port);
+    let allowed = text.split_whitespace().any(|token| {
+        token == port_str || token == port_tcp || token == port_udp
+    });
+    if !allowed {
+        warn!("========================================");
+        warn!("! WARNING: YOU HAVE SET A PORT FOR THE WEB APP BUT THE PORT ISN'T ALLOWED ON YOUR FIREWALL");
+        warn!("! PLEASE EXECUTE THE FOLLOWING COMMAND TO ACCESS IT VIA THE INTERNET:");
+        warn!("!   ufw allow {}", port);
+        warn!("========================================");
+    }
+}
+
 /// Parse a Coflnet `/cofl profit` response and return the total profit in coins.
 ///
 /// Expected format (color-stripped):
@@ -317,6 +351,40 @@ struct SessionTimeEntry {
     saved_at: u64,
 }
 
+/// Persisted profit totals for a single account in `profit_stats.json`.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
+struct ProfitStatsEntry {
+    /// Cumulative AH profit in coins.
+    ah_total: i64,
+    /// Cumulative Bazaar profit in coins.
+    bz_total: i64,
+}
+
+/// Load per-account profit stats from disk.
+fn load_profit_stats(path: &std::path::Path) -> HashMap<String, ProfitStatsEntry> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => return HashMap::new(),
+    };
+    serde_json::from_str(&raw).unwrap_or_default()
+}
+
+/// Persist the current profit totals for a given IGN.
+fn save_profit_stats(
+    path: &std::path::Path,
+    ign: &str,
+    tracker: &frikadellen_baf::profit::ProfitTracker,
+) {
+    let (ah, bz) = tracker.totals();
+    let mut map = load_profit_stats(path);
+    map.insert(ign.to_string(), ProfitStatsEntry { ah_total: ah, bz_total: bz });
+    if let Ok(json) = serde_json::to_string_pretty(&map) {
+        if let Err(e) = std::fs::write(path, json) {
+            tracing::warn!("[Profit] Failed to save profit stats: {}", e);
+        }
+    }
+}
+
 /// Return the current Unix timestamp in seconds.
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
@@ -475,6 +543,11 @@ async fn main() -> Result<()> {
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("session_times.json")))
         .unwrap_or_else(|| std::path::PathBuf::from("session_times.json"));
+    // Sidecar file for persisting AH/BZ profit totals across restarts (e.g. rest breaks).
+    let profit_path = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("profit_stats.json")))
+        .unwrap_or_else(|| std::path::PathBuf::from("profit_stats.json"));
     let previous_session_secs: u64 = {
         let times = load_session_times(&session_times_path);
         if let Some(entry) = times.get(&ingame_name) {
@@ -500,6 +573,11 @@ async fn main() -> Result<()> {
     info!("AH Flips: {}", if config.enable_ah_flips { "ENABLED" } else { "DISABLED" });
     info!("Bazaar Flips: {}", if config.enable_bazaar_flips { "ENABLED" } else { "DISABLED" });
     info!("Web GUI Port: {}", config.web_gui_port);
+
+    // Check whether the web GUI port is allowed through UFW (Linux firewall).
+    // Only warn on Linux where UFW is commonly used.
+    #[cfg(target_os = "linux")]
+    check_ufw_port(config.web_gui_port);
 
     if config.proxy_enabled {
         info!("Proxy: ENABLED — address: {:?}", config.proxy_address);
@@ -656,7 +734,22 @@ async fn main() -> Result<()> {
     *bot_client.ingame_name.write() = ingame_name.clone();
 
     // Shared profit tracker for AH and Bazaar realized profits.
-    let profit_tracker = Arc::new(frikadellen_baf::profit::ProfitTracker::new());
+    // Restore persisted totals from disk so profit statistics survive rest breaks.
+    let profit_tracker = {
+        let tracker = Arc::new(frikadellen_baf::profit::ProfitTracker::new());
+        let saved = load_profit_stats(&profit_path);
+        if let Some(entry) = saved.get(&ingame_name) {
+            if entry.ah_total != 0 {
+                tracker.set_ah_total(entry.ah_total);
+                info!("[Profit] Restored AH profit from disk: {} coins", entry.ah_total);
+            }
+            if entry.bz_total != 0 {
+                tracker.set_bz_total(entry.bz_total);
+                info!("[Profit] Restored BZ profit from disk: {} coins", entry.bz_total);
+            }
+        }
+        tracker
+    };
 
     // Shared tracker for active bazaar orders (web panel + profit calculation).
     let bazaar_tracker = Arc::new(frikadellen_baf::bazaar_tracker::BazaarOrderTracker::new());
@@ -3403,7 +3496,7 @@ async fn main() -> Result<()> {
     // Session time is saved right before restart so it is preserved across
     // the break — the account-switching timer is NOT reset.
     if config.humanization_enabled {
-        let command_queue_human = command_queue.clone();
+        let bot_client_human = bot_client.clone();
         let chat_tx_human = chat_tx.clone();
         let ign_human = ingame_name.clone();
         let webhook_url_human = config.active_webhook_url().map(|s| s.to_string());
@@ -3411,6 +3504,8 @@ async fn main() -> Result<()> {
         let prev_secs_human = previous_session_secs;
         let started_human = std::time::Instant::now();
         let macro_paused_human = macro_paused.clone();
+        let profit_tracker_human = profit_tracker.clone();
+        let profit_path_human = profit_path.clone();
         let min_interval = config.humanization_min_interval_minutes.max(5); // floor at 5 min
         let max_interval = config.humanization_max_interval_minutes.max(min_interval + 1);
         let min_break = config.humanization_min_break_minutes.max(1); // floor at 1 min
@@ -3421,7 +3516,6 @@ async fn main() -> Result<()> {
         );
         tokio::spawn(async move {
             use rand::Rng;
-            use frikadellen_baf::types::{CommandType, CommandPriority};
 
             // Sleep for a random interval between min and max
             let interval_secs = {
@@ -3476,13 +3570,11 @@ async fn main() -> Result<()> {
             print_mc_chat(&baf_msg);
             let _ = chat_tx_human.send(baf_msg);
 
-            // Disconnect from the server via /quit
-            command_queue_human.enqueue(
-                CommandType::SendChat { message: "/quit".to_string() },
-                CommandPriority::Critical,
-                false,
-            );
-            // Give the command processor time to process /quit
+            // Trigger a proper TCP-level disconnect via Azalea's disconnect mechanism.
+            // This avoids trying to send a "/quit" chat command that Hypixel does not
+            // recognise, ensuring the bot actually disconnects from the server.
+            bot_client_human.request_disconnect();
+            // Give Azalea time to process the disconnect before sleeping.
             sleep(Duration::from_secs(3)).await;
 
             info!("[Humanization] Disconnected — sleeping for {:.1}m", break_secs as f64 / 60.0);
@@ -3496,6 +3588,9 @@ async fn main() -> Result<()> {
             if let Some(ref url) = webhook_url_human {
                 frikadellen_baf::webhook::send_webhook_rest_break_end(&ign_human, url).await;
             }
+
+            // Save profit statistics so they survive the restart
+            save_profit_stats(&profit_path_human, &ign_human, &profit_tracker_human);
 
             // Save session time right before restart so the gap is near-zero
             // and session time is preserved across the break.
