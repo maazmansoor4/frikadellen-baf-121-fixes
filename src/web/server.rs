@@ -729,6 +729,7 @@ async fn list_item(
     if payload.starting_bid == 0 {
         return (StatusCode::BAD_REQUEST, "Starting bid must be greater than 0").into_response();
     }
+    // Clamp to Hypixel's maximum auction duration of 7 days (168 hours).
     let duration = payload.duration_hours.clamp(1, 168);
 
     info!(

@@ -1102,8 +1102,11 @@ function openListItemModal(slot, slotIndex) {
 }
 
 function closeListItemModal(evt) {
-    // Called by backdrop click (evt is the mouse event) or cancel button (no evt)
-    if (evt && evt.target !== $('list-item-modal')) return;
+    // When called from the backdrop onclick, only close if the click landed on
+    // the overlay itself (not a child element).  The modal-box uses
+    // stopPropagation so clicks inside it never reach here, but using
+    // currentTarget === target is the standard guard for this pattern.
+    if (evt && evt.currentTarget !== evt.target) return;
     $('list-item-modal').classList.add('hidden');
     _listItemSlot = null;
 }
@@ -1222,12 +1225,12 @@ document.addEventListener('click', e => {
     if (!$('theme-picker').contains(e.target)) closeThemeMenu();
 });
 
-// Close list-item modal on Escape, submit on Enter (in price field)
+// Close list-item modal on Escape, submit on Enter
 document.addEventListener('keydown', e => {
     const modal = $('list-item-modal');
     if (!modal || modal.classList.contains('hidden')) return;
     if (e.key === 'Escape') { closeListItemModal(); }
-    else if (e.key === 'Enter' && document.activeElement !== $('li-duration')) { submitListItem(); }
+    else if (e.key === 'Enter') { submitListItem(); }
 });
 
 // Restore saved theme
