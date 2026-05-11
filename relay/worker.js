@@ -256,6 +256,8 @@ function buildBazaarFlipEmbed(payload, { title, color }) {
 
 function formatNumber(n) {
   n = Number(n);
+  // Numeric separator literals (_) are ES2021; Cloudflare Workers' V8 engine
+  // has supported them since 2019, so this is safe for this target runtime.
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(2)}K`;
   return String(Math.round(n));

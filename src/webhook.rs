@@ -62,7 +62,10 @@ fn hmac_sha256_hex(key: &str, message: &str) -> String {
 /// unsigned requests (useful during local development).
 async fn post_relay(event: &str, payload: serde_json::Value) {
     let Some(relay_url) = notify_relay_url() else {
-        // Relay not configured — skip silently.
+        tracing::debug!(
+            "[Relay] BAF_NOTIFY_RELAY_URL not set — skipping {} notification",
+            event
+        );
         return;
     };
 
