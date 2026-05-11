@@ -8,19 +8,35 @@ static HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
         .expect("Failed to build reqwest client")
 });
 
-/// Return the relay endpoint URL from the `BAF_NOTIFY_RELAY_URL` environment
-/// variable.  If the variable is absent or empty the public-channel notifications
-/// are silently skipped — the Discord webhook URL never needs to appear in source.
+/// Return the relay endpoint URL.
+///
+/// The value is first looked up at **compile time** via `option_env!`.  When the
+/// release CI sets `BAF_NOTIFY_RELAY_URL` as a build environment variable the URL
+/// is baked directly into the binary — users never need to configure anything.
+/// During local development the runtime environment variable of the same name is
+/// used as a fallback, so you can test without a full rebuild.  If neither is
+/// set, public-channel notifications are silently skipped.
 fn notify_relay_url() -> Option<String> {
-    std::env::var("BAF_NOTIFY_RELAY_URL").ok().filter(|s| !s.is_empty())
+    // `option_env!` is evaluated at compile time; returns None when the var is absent.
+    const COMPILE_TIME: Option<&str> = option_env!("BAF_NOTIFY_RELAY_URL");
+    COMPILE_TIME
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_owned())
+        .or_else(|| std::env::var("BAF_NOTIFY_RELAY_URL").ok().filter(|s| !s.is_empty()))
 }
 
-/// Return the HMAC-SHA256 signing secret from the `BAF_NOTIFY_SECRET`
-/// environment variable.  When present, every relay request is signed so the
-/// relay server can reject spoofed requests from third parties who merely read
-/// the source code.
+/// Return the HMAC-SHA256 signing secret.
+///
+/// Like `notify_relay_url`, the value is baked in at compile time when the CI
+/// sets `BAF_NOTIFY_SECRET` during the build.  Falls back to the runtime
+/// environment variable for local development.  When present, every relay
+/// request is signed so the relay server can reject spoofed requests.
 fn notify_relay_secret() -> Option<String> {
-    std::env::var("BAF_NOTIFY_SECRET").ok().filter(|s| !s.is_empty())
+    const COMPILE_TIME: Option<&str> = option_env!("BAF_NOTIFY_SECRET");
+    COMPILE_TIME
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_owned())
+        .or_else(|| std::env::var("BAF_NOTIFY_SECRET").ok().filter(|s| !s.is_empty()))
 }
 
 /// Compute an HMAC-SHA256 hex digest over `message` using `key`.
