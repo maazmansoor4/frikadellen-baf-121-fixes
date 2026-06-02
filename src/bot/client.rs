@@ -6394,7 +6394,7 @@ fn send_chat_command(bot: &Client, content: &str) {
 /// game tick (50ms).  Returns `None` if the ECS lock cannot be acquired or
 /// the resource is missing (e.g. before the bot is fully connected).
 ///
-/// Used to align time-critical packets (like `/viewauction`) with tick
+/// Used to align time-critical packets (like buy clicks) with tick
 /// boundaries so they arrive at the start of a new server processing window.
 fn subscribe_to_ticks(bot: &Client) -> Option<tokio::sync::broadcast::Receiver<()>> {
     let ecs = bot.ecs.lock();
