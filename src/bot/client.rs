@@ -15,7 +15,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use azalea_inventory::operations::ClickType;
 use azalea_client::chat::ChatPacket;
 use azalea_client::inventory::{MenuOpenedEvent, SetContainerContentEvent};
-use azalea_client::tick_broadcast::TickBroadcast;
 use bevy_app::AppExit;
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
@@ -6502,17 +6501,6 @@ fn send_chat_command(bot: &Client, content: &str) {
     bot.write_packet(ServerboundChatCommand {
         command: command.to_string(),
     });
-}
-
-/// Subscribe to the ECS `TickBroadcast` to receive notifications on every
-/// game tick (50ms).  Returns `None` if the ECS lock cannot be acquired or
-/// the resource is missing (e.g. before the bot is fully connected).
-///
-/// Used to align time-critical packets (like buy clicks) with tick
-/// boundaries so they arrive at the start of a new server processing window.
-fn subscribe_to_ticks(bot: &Client) -> Option<tokio::sync::broadcast::Receiver<()>> {
-    let ecs = bot.ecs.lock();
-    ecs.get_resource::<TickBroadcast>().map(|tb| tb.subscribe())
 }
 
 /// Send a chat command directly to the TCP socket via `with_raw_connection_mut`,
