@@ -3256,26 +3256,11 @@ async fn execute_command(
             // comparison in the OpenScreen handler is accurate for THIS purchase.
             *state.window_open_info.write() = None;
 
-            // ---- Tick-aligned send ----
-            // Wait for the next game tick boundary before sending /viewauction.
-            // Minecraft servers process packets received during a tick at its
-            // end.  By sending right after a tick fires, the packet arrives at
-            // the very start of the server's next 50ms processing window,
-            // giving the full tick for the round-trip to complete.  This
-            // shaves off up to 50ms of random tick-phase jitter from buy speed.
-            //
-            // The TickBroadcast resource fires once per GameTick inside the ECS
-            // schedule.  We subscribe, wait for at most one tick (50ms) to avoid
-            // stalling, then send immediately on the raw TCP connection.
-            if let Some(mut tick_rx) = subscribe_to_ticks(bot) {
-                let pre_tick = std::time::Instant::now();
-                let _ = tokio::time::timeout(
-                    tokio::time::Duration::from_millis(55),
-                    tick_rx.recv(),
-                ).await;
-                let waited_ms = pre_tick.elapsed().as_secs_f64() * 1000.0;
-                debug!("[Timing] Tick-aligned /viewauction: waited {:.1}ms for tick boundary", waited_ms);
-            }
+            // Send /viewauction immediately — do NOT wait for tick alignment.
+            // The server processes incoming packets at the end of each 50ms
+            // tick anyway, so sending instantly means the packet lands in the
+            // very next tick window.  Waiting for a tick boundary only added
+            // up to 50ms of unnecessary latency.
 
             // Record buy-speed start time right before sending /viewauction
             // so the measurement covers command-send → coins-in-escrow (the
