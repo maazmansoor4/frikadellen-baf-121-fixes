@@ -585,6 +585,7 @@ impl BotClient {
             pending_purchase_at_ms: Arc::new(RwLock::new(None)),
             bed_timing_active: Arc::new(AtomicBool::new(false)),
             skip_click_sent: Arc::new(AtomicBool::new(false)),
+            fast_buy_clicked: Arc::new(AtomicBool::new(false)),
             slot_data_notify: Arc::new(tokio::sync::Notify::new()),
             window_open_notify: Arc::new(tokio::sync::Notify::new()),
             window_open_info: Arc::new(RwLock::new(None)),
@@ -808,6 +809,11 @@ impl BotClient {
     /// My Auctions window yet.
     pub fn get_cached_my_auctions_json(&self) -> Option<String> {
         self.cached_my_auctions_json.read().clone()
+    }
+
+    /// Returns the number of items currently tracked as active auction listings.
+    pub fn active_auction_count(&self) -> usize {
+        self.active_auction_listings.read().len()
     }
 
     /// Returns true if the bazaar order limit has been hit and not yet cleared.
@@ -1191,6 +1197,11 @@ pub struct BotClientState {
     /// Set when a skip-click (pre-click on predicted Confirm Purchase window) is sent.
     /// The Confirm Purchase handler checks this to avoid sending a duplicate reactive click.
     pub skip_click_sent: Arc<AtomicBool>,
+    /// Set when the fast-path purchase task (spawned in execute_command, triggered
+    /// by the ECS observer's window_open_notify) has already sent the buy-click
+    /// and skip-click.  The Event::Packet handle_window_interaction checks this
+    /// to avoid sending duplicate clicks.  Reset at the start of each purchase.
+    pub fast_buy_clicked: Arc<AtomicBool>,
     /// Notified when ContainerSetSlot / ContainerSetContent arrives so the purchase
     /// handler can react instantly instead of polling every 10ms.
     pub slot_data_notify: Arc<tokio::sync::Notify>,
@@ -1353,6 +1364,7 @@ impl Default for BotClientState {
             pending_purchase_at_ms: Arc::new(RwLock::new(None)),
             bed_timing_active: Arc::new(AtomicBool::new(false)),
             skip_click_sent: Arc::new(AtomicBool::new(false)),
+            fast_buy_clicked: Arc::new(AtomicBool::new(false)),
             slot_data_notify: Arc::new(tokio::sync::Notify::new()),
             window_open_notify: Arc::new(tokio::sync::Notify::new()),
             window_open_info: Arc::new(RwLock::new(None)),
@@ -3250,6 +3262,12 @@ async fn execute_command(
             // comparison in the OpenScreen handler is accurate for THIS purchase.
             *state.window_open_info.write() = None;
 
+            // Send /viewauction immediately — do NOT wait for tick alignment.
+            // The server processes incoming packets at the end of each 50ms
+            // tick anyway, so sending instantly means the packet lands in the
+            // very next tick window.  Waiting for a tick boundary only added
+            // up to 50ms of unnecessary latency.
+
             // Record buy-speed start time right before sending /viewauction
             // so the measurement covers command-send → coins-in-escrow (the
             // relevant metric), NOT flip-receive → escrow which includes
@@ -3264,8 +3282,131 @@ async fn execute_command(
             // bed (grace-period) and freemoney mode is enabled.
             *state.pending_purchase_at_ms.write() = flip.purchase_at_ms;
             
+            // Reset fast-buy flag before setting state to Purchasing.
+            state.fast_buy_clicked.store(false, Ordering::Relaxed);
+            
             // Set state to purchasing
             *state.bot_state.write() = BotState::Purchasing;
+
+            // ---- Fast-path purchase task ----
+            // Spawn a task that waits on the ECS observer's window_open_notify
+            // (fires during apply_deferred, 20-70ms BEFORE Event::Packet delivers
+            // the OpenScreen event).  When the BIN Auction View opens, this task
+            // reads slot 31 and sends buy-click + skip-click immediately, bypassing
+            // the Event::Packet pipeline overhead entirely.
+            //
+            // Anti-cheat safety:
+            // - Still waits for the server to send OpenScreen before clicking
+            // - Still checks slot 31 contains gold_nugget before any click
+            // - Uses identical ServerboundContainerClick packets
+            // - TCP ordering guarantees the server has prepared the window
+            // - This is equivalent to having lower client-side latency
+            {
+                let fast_bot = bot.clone();
+                let fast_state = state.clone();
+                tokio::spawn(async move {
+                    // Wait for the ECS observer to detect OpenScreen.
+                    // The observer fires during apply_deferred (~20-70ms before
+                    // Event::Packet would deliver it).  The /viewauction RTT is
+                    // at least 50ms (one server tick) + network RTT, so this task
+                    // is always waiting before the notification fires.
+                    fast_state.window_open_notify.notified().await;
+
+                    // Verify we're still purchasing (could have been aborted).
+                    if *fast_state.bot_state.read() != BotState::Purchasing {
+                        return;
+                    }
+
+                    // Read window info set by the ECS observer.
+                    let info = fast_state.window_open_info.read().clone();
+                    let info = match info {
+                        Some(i) => i,
+                        None => return,
+                    };
+
+                    let window_id = info.window_id as u8;
+                    let title = fast_state.handlers.parse_window_title(&info.title);
+
+                    if !title.contains("BIN Auction View") && !title.contains("Auction View") {
+                        return;
+                    }
+
+                    if let Some(t0) = *fast_state.purchase_start_time.read() {
+                        info!(
+                            "[Timing] /viewauction → fast-path started: {:.1}ms",
+                            t0.elapsed().as_secs_f64() * 1000.0
+                        );
+                    }
+
+                    // Wait for slot 31 data — same safety gate as the Event::Packet
+                    // path.  If OpenScreen and ContainerSetContent arrive in the same
+                    // TCP segment (common), the ECS frame processes both before
+                    // releasing the World lock, so slot 31 is already populated when
+                    // we read it.
+                    let slot_31_kind = {
+                        let poll_deadline = tokio::time::Instant::now()
+                            + tokio::time::Duration::from_millis(500);
+                        let mut kind;
+                        loop {
+                            let notified = fast_state.slot_data_notify.notified();
+                            let menu = fast_bot.menu();
+                            let slots = menu.slots();
+                            kind = slots.get(31).map(|s| {
+                                if s.is_empty() { "air".to_string() }
+                                else { s.kind().to_string().to_lowercase() }
+                            }).unwrap_or_else(|| "air".to_string());
+                            if kind != "air" || tokio::time::Instant::now() >= poll_deadline {
+                                break;
+                            }
+                            let remaining = poll_deadline - tokio::time::Instant::now();
+                            tokio::select! {
+                                _ = notified => {}
+                                _ = tokio::time::sleep(remaining) => {}
+                            }
+                        }
+                        kind
+                    };
+
+                    if !slot_31_kind.contains("gold") {
+                        // Not a buyable auction (bed, potato, feather, etc.).
+                        // Let the Event::Packet handler deal with non-buyable cases.
+                        return;
+                    }
+
+                    // gold_nugget confirmed — send buy-click immediately.
+                    // No tick-alignment wait: with low ping (2ms) both the
+                    // buy-click and skip-click are written to the same TCP
+                    // write buffer and arrive at the server in one segment.
+                    if let Some(t0) = *fast_state.purchase_start_time.read() {
+                        info!(
+                            "[Timing] /viewauction → fast-path buy click: {:.1}ms",
+                            t0.elapsed().as_secs_f64() * 1000.0
+                        );
+                    }
+
+                    if fast_state.skip {
+                        info!("[AH] Fast-path: gold_nugget confirmed — sending buy + skip-click");
+                    } else {
+                        info!("[AH] Fast-path: gold_nugget confirmed — sending buy click");
+                    }
+
+                    send_raw_click(&fast_bot, window_id, 31);
+
+                    if fast_state.skip {
+                        // Redundant second buy click to guard against packet loss.
+                        send_raw_click(&fast_bot, window_id, 31);
+
+                        let next_wid = if window_id == 255 { 1u8 } else { window_id + 1 };
+                        info!("[AH] Fast-path skip: pre-clicking slot 11 on predicted window {} (same burst)", next_wid);
+                        fast_state.skip_click_sent.store(true, Ordering::Relaxed);
+                        send_raw_click(&fast_bot, next_wid, 11);
+                    }
+
+                    // Signal that the fast path handled the buy click so the
+                    // Event::Packet handler doesn't send duplicate clicks.
+                    fast_state.fast_buy_clicked.store(true, Ordering::Relaxed);
+                });
+            }
         }
         CommandType::BazaarBuyOrder { item_name, item_tag, amount, price_per_unit } => {
             // Abort immediately if at the bazaar order limit — no point opening
@@ -3709,49 +3850,45 @@ async fn handle_window_interaction(
                     }
                 } else if slot_31_kind.contains("gold_nugget") {
                     // ---- Buyable auction (SAFE: gold_nugget confirmed) ----
-                    // Now that we know slot 31 is gold_nugget (the buy button),
-                    // send the buy-click.  Sending AFTER confirmation avoids
-                    // clicking non-interactive items like feather (loading
-                    // placeholder) which is an "impossible action" that can
-                    // trigger Hypixel anti-cheat.
-                    //
-                    // Anti-cheat safety: This click only happens AFTER the
-                    // server has sent both OpenScreen AND ContainerSetContent
-                    // with gold_nugget in slot 31.  The PacketAcceleratorPlugin
-                    // reduces how long we wait to notice these packets, but the
-                    // click still occurs after the server has prepared the
-                    // window — which is exactly what a fast human player does.
-                    if let Some(t0) = *state.purchase_start_time.read() {
-                        info!(
-                            "[Timing] /viewauction → buy click sent: {:.1}ms",
-                            t0.elapsed().as_secs_f64() * 1000.0
-                        );
-                    }
-                    if state.skip {
-                        info!("[AH] gold_nugget confirmed — sending buy + skip-click");
+                    // Check if the fast-path purchase task (spawned in
+                    // execute_command, triggered by ECS observer) already sent
+                    // the buy-click and skip-click.  If so, skip to avoid
+                    // duplicate clicks.
+                    if state.fast_buy_clicked.load(Ordering::Relaxed) {
+                        info!("[AH] Fast-path already sent buy click — skipping Event::Packet click");
                     } else {
-                        info!("[AH] gold_nugget confirmed — sending buy click");
-                    }
-                    // Use raw connection to bypass ECS queue for the buy click.
-                    send_raw_click(bot, window_id, 31);
-
-                    // Skip-click: only when skip is enabled,
-                    // pre-click slot 11 on the predicted Confirm Purchase
-                    // window in the same TCP burst as the buy-click.
-                    // When skip is off the Confirm Purchase handler will
-                    // click confirm reactively when the window opens.
-                    if state.skip {
-                        // Redundant second buy click to guard against packet
-                        // loss — only needed when we also send the skip-click,
-                        // because a lost buy-click + queued confirm-click on a
-                        // window that never opens is an impossible action.
+                        // Fallback: fast path did not fire (e.g. window was not
+                        // BIN Auction View, or observer didn't trigger).  Send
+                        // buy-click from the Event::Packet path as before.
+                        if let Some(t0) = *state.purchase_start_time.read() {
+                            info!(
+                                "[Timing] /viewauction → buy click sent (fallback): {:.1}ms",
+                                t0.elapsed().as_secs_f64() * 1000.0
+                            );
+                        }
+                        if state.skip {
+                            info!("[AH] gold_nugget confirmed — sending buy + skip-click (fallback)");
+                        } else {
+                            info!("[AH] gold_nugget confirmed — sending buy click (fallback)");
+                        }
+                        // Send buy-click immediately via raw connection — no tick-
+                        // alignment wait.  With low ping the buy-click and skip-click
+                        // are written to the same TCP buffer and arrive at the server
+                        // in one segment, landing in the same tick regardless.
                         send_raw_click(bot, window_id, 31);
 
-                        let next_wid = if window_id == 255 { 1u8 } else { window_id + 1 };
-                        info!("[AH] Skip: pre-clicking slot 11 on predicted window {} (same burst)", next_wid);
-                        state.skip_click_sent.store(true, Ordering::Relaxed);
-                        // Use raw connection for the skip-click too.
-                        send_raw_click(bot, next_wid, 11);
+                        if state.skip {
+                            // Redundant second buy click to guard against packet
+                            // loss — only needed when we also send the skip-click,
+                            // because a lost buy-click + queued confirm-click on a
+                            // window that never opens is an impossible action.
+                            send_raw_click(bot, window_id, 31);
+
+                            let next_wid = if window_id == 255 { 1u8 } else { window_id + 1 };
+                            info!("[AH] Skip: pre-clicking slot 11 on predicted window {} (same burst)", next_wid);
+                            state.skip_click_sent.store(true, Ordering::Relaxed);
+                            send_raw_click(bot, next_wid, 11);
+                        }
                     }
                 } else if !slot_31_kind.contains("air") {
                     // ---- Non-buyable auction ----
