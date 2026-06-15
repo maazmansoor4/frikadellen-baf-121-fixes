@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use azalea_inventory::operations::ClickType;
 use azalea_client::chat::ChatPacket;
 use azalea_client::inventory::{MenuOpenedEvent, SetContainerContentEvent};
+use azalea_client::auto_reconnect::AutoReconnectDelay;
 use bevy_app::AppExit;
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
@@ -3170,8 +3171,22 @@ async fn event_handler(
 /// The caller should return immediately when this returns `true`.
 fn handle_disconnect_if_requested(bot: &Client, state: &BotClientState) -> bool {
     if state.disconnect_requested.load(Ordering::Acquire) {
-        info!("[CommandProcessor] Disconnect requested — calling bot.disconnect()");
+        info!("[CommandProcessor] Disconnect requested — disabling auto-reconnect and calling bot.disconnect()");
         state.disconnect_requested.store(false, Ordering::Release);
+        // Azalea's AutoReconnectPlugin rejoins the server ~5s after ANY
+        // disconnect. For an *intentional* disconnect (e.g. a humanization rest
+        // break) that silently brings the bot back online mid-break — which is
+        // exactly the "break doesn't disconnect / macro keeps going" bug. Set
+        // the reconnect delay to Duration::MAX (treated as "disabled") BEFORE
+        // issuing the disconnect so the DisconnectEvent handler schedules no
+        // rejoin. The rest-break flow restarts the whole process afterwards,
+        // which spawns a fresh ECS with auto-reconnect re-enabled.
+        {
+            let mut ecs = bot.ecs.lock();
+            if let Some(mut delay) = ecs.get_resource_mut::<AutoReconnectDelay>() {
+                delay.delay = std::time::Duration::MAX;
+            }
+        }
         bot.disconnect();
         true
     } else {
@@ -4649,6 +4664,13 @@ async fn handle_window_interaction(
                         } else {
                             find_slot_by_name(&slots, &item_name)
                         };
+                        // Safety: only ever click a real, non-empty PLAYER-inventory slot.
+                        // A name-search fallback can otherwise resolve to a GUI/control slot
+                        // or an emptied slot; clicking that to "sell" a non-item is an
+                        // impossible action Hypixel Watchdog flags. Invalid → fall through to
+                        // the abort branch below instead of clicking garbage.
+                        let target_slot = target_slot
+                            .filter(|&i| i >= player_start && i < slots.len() && !slots[i].is_empty());
                         if let Some(i) = target_slot {
                             info!("[Auction] Co-op AH: clicking item at slot {}", i);
                             let item_to_carry = slots[i].clone();
@@ -4695,6 +4717,10 @@ async fn handle_window_interaction(
                         } else {
                             find_slot_by_name(&slots, &item_name)
                         };
+                        // Safety: only ever click a real, non-empty PLAYER-inventory slot
+                        // (see Co-op AH branch). Invalid → abort instead of clicking garbage.
+                        let target_slot = target_slot
+                            .filter(|&i| i >= player_start && i < slots.len() && !slots[i].is_empty());
                         if let Some(i) = target_slot {
                             info!("[Auction] ClickCreate→SelectBIN: clicking item at slot {}", i);
                             let item_to_carry = slots[i].clone();
@@ -4745,6 +4771,10 @@ async fn handle_window_interaction(
                             find_slot_by_name(&slots, &item_name)
                         };
 
+                        // Safety: only ever click a real, non-empty PLAYER-inventory slot
+                        // (see Co-op AH branch). Invalid → abort instead of clicking garbage.
+                        let target_slot = target_slot
+                            .filter(|&i| i >= player_start && i < slots.len() && !slots[i].is_empty());
                         if let Some(i) = target_slot {
                             info!("[Auction] Clicking item at slot {}", i);
                             let item_to_carry = slots[i].clone();
