@@ -6817,7 +6817,7 @@ async fn run_startup_workflow(
     auto_cookie_hours: Arc<RwLock<u64>>,
     command_queue: Arc<RwLock<Option<CommandQueue>>>,
     startup_in_progress: Arc<AtomicBool>,
-    _enable_bazaar_flips: Arc<AtomicBool>,
+    enable_bazaar_flips: Arc<AtomicBool>,
 ) {
     use crate::types::{CommandType, CommandPriority};
 
@@ -6904,10 +6904,17 @@ async fn run_startup_workflow(
         info!("[Startup] Step 1/4: Cookie check skipped (AUTO_COOKIE=0)");
     }
 
-    // Step 2/4: Bazaar order management — always cancel all open orders and
-    // collect filled ones on startup so the bot starts with a clean slate.
-    let cancel_open = true;
-    let mode_str = if cancel_open { "cancel + collect" } else { "collect-only" };
+    // Step 2/4: Bazaar order management.
+    //
+    // Only do the *destructive* startup cancel ("clean slate") when the bazaar
+    // finder is actually enabled.  When bazaar flips are disabled the user may
+    // have orders they placed manually or want to keep — cancelling them all on
+    // startup "could end bad".  In that case we run a non-destructive
+    // collect-only pass: filled orders are still claimed and open orders are
+    // discovered/tracked for the web panel, but nothing is cancelled.  Once a
+    // flip actually comes in, the order-filled path will trigger management.
+    let cancel_open = enable_bazaar_flips.load(Ordering::Relaxed);
+    let mode_str = if cancel_open { "cancel + collect" } else { "collect-only (bz finder disabled)" };
     info!("[Startup] Step 2/4: Managing bazaar orders (startup: {})...", mode_str);
     await_queued_command(
         &queue,
