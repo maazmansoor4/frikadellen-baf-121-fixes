@@ -1740,6 +1740,52 @@ fn find_slot_by_name(slots: &[azalea_inventory::ItemStack], name: &str) -> Optio
     None
 }
 
+/// Like [`find_slot_by_name`] but restricted to the player-inventory portion of
+/// an open container (`inv_start`..end) and to non-empty slots.
+///
+/// The auction "select item" flow uses this for its name fallback so it can only
+/// ever resolve to a real item the player is holding — never a GUI/display slot
+/// (clicking one to "sell" a non-item is an impossible action Watchdog flags),
+/// and never an empty slot. Returns the absolute slot index.
+fn find_inventory_slot_by_name(
+    slots: &[azalea_inventory::ItemStack],
+    inv_start: usize,
+    name: &str,
+) -> Option<usize> {
+    if inv_start >= slots.len() {
+        return None;
+    }
+    let name_lower = name.to_lowercase();
+    let name_norm = normalize_for_matching(name);
+    let tokens: Vec<&str> = name_norm.split_whitespace().collect();
+    // Phase 0: exact contains; 1: normalized contains; 2: all-tokens-present.
+    for phase in 0..3u8 {
+        for i in inv_start..slots.len() {
+            if slots[i].is_empty() {
+                continue;
+            }
+            let display = match get_item_display_name_from_slot(&slots[i]) {
+                Some(d) => d,
+                None => continue,
+            };
+            let hit = match phase {
+                0 => display.to_lowercase().contains(&name_lower),
+                1 => normalize_for_matching(&display).contains(&name_norm),
+                _ => {
+                    tokens.len() > 1 && {
+                        let dn = normalize_for_matching(&display);
+                        tokens.iter().all(|t| dn.contains(t))
+                    }
+                }
+            };
+            if hit {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
 fn lore_contains_phrase(lore: &[String], needle: &str) -> bool {
     let needle_lower = needle.to_lowercase();
     lore.iter()
@@ -4738,10 +4784,15 @@ async fn handle_window_interaction(
                         } else {
                             find_slot_by_name(&slots, &item_name)
                         };
-                        // Safety: only ever click a real, non-empty PLAYER-inventory slot
-                        // (see Co-op AH branch). Invalid → abort instead of clicking garbage.
+                        // Safety: only ever click a real, non-empty PLAYER-inventory slot —
+                        // never a GUI/display slot or an empty slot (selling a non-item is an
+                        // impossible action Watchdog flags). But if the resolved slot is
+                        // rejected (e.g. a whole-window name search matched a GUI display
+                        // slot), fall back to searching ONLY the player inventory so a
+                        // legitimately-held item is still listed instead of aborting the sale.
                         let target_slot = target_slot
-                            .filter(|&i| i >= player_start && i < slots.len() && !slots[i].is_empty());
+                            .filter(|&i| i >= player_start && i < slots.len() && !slots[i].is_empty())
+                            .or_else(|| find_inventory_slot_by_name(&slots, player_start, &item_name));
                         if let Some(i) = target_slot {
                             info!("[Auction] ClickCreate→SelectBIN: clicking item at slot {}", i);
                             let item_to_carry = slots[i].clone();
@@ -4792,10 +4843,15 @@ async fn handle_window_interaction(
                             find_slot_by_name(&slots, &item_name)
                         };
 
-                        // Safety: only ever click a real, non-empty PLAYER-inventory slot
-                        // (see Co-op AH branch). Invalid → abort instead of clicking garbage.
+                        // Safety: only ever click a real, non-empty PLAYER-inventory slot —
+                        // never a GUI/display slot or an empty slot (selling a non-item is an
+                        // impossible action Watchdog flags). But if the resolved slot is
+                        // rejected (e.g. a whole-window name search matched a GUI display
+                        // slot), fall back to searching ONLY the player inventory so a
+                        // legitimately-held item is still listed instead of aborting the sale.
                         let target_slot = target_slot
-                            .filter(|&i| i >= player_start && i < slots.len() && !slots[i].is_empty());
+                            .filter(|&i| i >= player_start && i < slots.len() && !slots[i].is_empty())
+                            .or_else(|| find_inventory_slot_by_name(&slots, player_start, &item_name));
                         if let Some(i) = target_slot {
                             info!("[Auction] Clicking item at slot {}", i);
                             let item_to_carry = slots[i].clone();
