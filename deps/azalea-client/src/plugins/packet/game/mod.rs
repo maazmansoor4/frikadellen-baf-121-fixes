@@ -21,7 +21,7 @@ use azalea_registry::builtin::EntityKind;
 use azalea_world::{InstanceContainer, InstanceName, MinecraftEntityId, PartialInstance};
 use bevy_ecs::{prelude::*, system::SystemState};
 pub use events::*;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::{
     ClientInformation,
@@ -41,6 +41,10 @@ use crate::{
 };
 
 pub fn process_packet(ecs: &mut World, player: Entity, packet: &ClientboundGamePacket) {
+    info!(
+        "[process_packet] called: {:?}",
+        std::mem::discriminant(packet)
+    );
     let mut handler = GamePacketHandler { player, ecs };
 
     // the order of these doesn't matter, that's decided by the protocol library
@@ -957,6 +961,7 @@ impl GamePacketHandler<'_> {
             },
         );
     }
+
     pub fn keep_alive(&mut self, p: &ClientboundKeepAlive) {
         debug!("Got keep alive packet {p:?} for {:?}", self.player);
 

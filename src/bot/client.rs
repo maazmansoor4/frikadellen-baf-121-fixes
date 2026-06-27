@@ -24,12 +24,10 @@ use crate::state::CommandQueue;
 use crate::types::{BotState, QueuedCommand};
 use crate::websocket::CoflWebSocket;
 
-pub static LAST_PING_MS: once_cell::sync::Lazy<Arc<parking_lot::Mutex<Option<u64>>>> =
-    once_cell::sync::Lazy::new(|| Arc::new(parking_lot::Mutex::new(None)));
-
-pub static KEEP_ALIVE_SENT: once_cell::sync::Lazy<
-    Arc<parking_lot::Mutex<Option<std::time::Instant>>>,
-> = once_cell::sync::Lazy::new(|| Arc::new(parking_lot::Mutex::new(None)));
+pub static PING_SEND_TIME: Lazy<Arc<parking_lot::Mutex<Option<std::time::Instant>>>> =
+    Lazy::new(|| Arc::new(parking_lot::Mutex::new(None)));
+pub static LAST_PING_MS: Lazy<Arc<parking_lot::Mutex<Option<u64>>>> =
+    Lazy::new(|| Arc::new(parking_lot::Mutex::new(None)));
 
 /// Connection wait duration (seconds) - time to wait for bot connection to establish
 const CONNECTION_WAIT_SECONDS: u64 = 2;
@@ -3015,13 +3013,12 @@ async fn event_handler(bot: Client, event: Event, state: BotClientState) -> Resu
         }
 
         Event::Packet(packet) => {
-            if let ClientboundGamePacket::KeepAlive(_) = packet.as_ref() {
-                let mut sent_lock = KEEP_ALIVE_SENT.lock();
-                if let Some(sent) = *sent_lock {
+            if let ClientboundGamePacket::PongResponse(_) = packet.as_ref() {
+                if let Some(sent) = *PING_SEND_TIME.lock() {
                     let ms = sent.elapsed().as_millis() as u64;
                     *LAST_PING_MS.lock() = Some(ms);
+                    info!("[Ping] RTT: {}ms", ms);
                 }
-                *sent_lock = Some(std::time::Instant::now());
             }
 
             // Handle specific packets for window open/close and inventory updates
@@ -3624,6 +3621,16 @@ async fn execute_command(bot: &Client, command: &QueuedCommand, state: &BotClien
     }
 
     match &command.command_type {
+        CommandType::SendPingRequest => {
+            use azalea_protocol::packets::game::s_ping_request::ServerboundPingRequest;
+            *PING_SEND_TIME.lock() = Some(std::time::Instant::now());
+            let packet = ServerboundPingRequest { time: 0 };
+            bot.with_raw_connection_mut(|mut raw_conn| {
+                if let Err(e) = raw_conn.write(packet) {
+                    error!("[Ping] Failed to send ping request: {e}");
+                }
+            });
+        }
         CommandType::SendChat { message } => {
             // Send chat message to Minecraft
             info!("Sending chat message: {}", message);

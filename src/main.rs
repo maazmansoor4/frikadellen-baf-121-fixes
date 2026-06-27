@@ -22,6 +22,9 @@ use tokio::sync::broadcast;
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
 
+static LAST_COFL_PING_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LAST_COFL_DELAY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 const VERSION: &str = "af-3.0";
 const PERIODIC_AH_CLAIM_CHECK_INTERVAL_SECS: u64 = 300;
 /// If no auction has been listed for this many seconds, force a `/cofl sellinventory`
@@ -684,9 +687,6 @@ async fn main() -> Result<()> {
     // Coflnet premium info — parsed from "You have PremiumPlus until ..." writeToChat message.
     // Tuple: (tier, expires_str) e.g. ("Premium Plus", "2026-Feb-10 08:55 UTC").
     let cofl_premium: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
-
-    let last_ping_ms: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
-    let keep_alive_sent: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
 
     // Auto-detected COFL license index for the first account's IGN.
     // Populated at startup by requesting `/cofl licenses list <first_ign>` and
@@ -2729,6 +2729,42 @@ async fn main() -> Result<()> {
                         debug!("[COFL Chat] {}", msg);
                     }
                     // Broadcast to web panel clients
+
+                    // Parse COFL ping — must be before msg is moved by chat_tx_ws.send()
+                    if let Some(pos) = msg.find("The time to receive flips is estimated to be ") {
+                        let rest =
+                            &msg[pos + "The time to receive flips is estimated to be ".len()..];
+                        let clean: String = rest
+                            .chars()
+                            .filter(|&c| c != '§')
+                            .collect::<String>()
+                            .chars()
+                            .skip_while(|c| !c.is_ascii_digit())
+                            .collect();
+                        let digits: String = clean
+                            .chars()
+                            .take_while(|c| c.is_ascii_digit() || *c == '.')
+                            .collect();
+                        if let Ok(ms) = digits.parse::<f64>() {
+                            LAST_COFL_PING_MS
+                                .store((ms * 10.0) as u64, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        if msg.contains("You are currently delayed by ") {
+                            if let Some(pos) = msg.find("§b") {
+                                let rest = &msg[pos + 2..]; // skip §b
+                                let digits: String = rest
+                                    .chars()
+                                    .take_while(|c| c.is_ascii_digit() || *c == '.')
+                                    .collect();
+                                if let Ok(secs) = digits.parse::<f64>() {
+                                    LAST_COFL_DELAY_MS.store(
+                                        (secs * 1000.0) as u64,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                }
+                            }
+                        }
+                    }
                     let _ = chat_tx_ws.send(msg);
                 }
                 CoflEvent::Command(cmd) => {
@@ -2745,9 +2781,10 @@ async fn main() -> Result<()> {
                             let args = parts[2..].join(" ");
 
                             if command == "connect" && !args.is_empty() {
-                                info!("[RegionSwitch] Reconnecting to: {}", args);
+                                let url = args.replace("ws://", "wss://");
+                                info!("[RegionSwitch] Reconnecting to: {}", url);
                                 let mut new_config = config_clone.clone();
-                                new_config.websocket_url = args;
+                                new_config.websocket_url = url;
                                 let _ = config_loader_ws.save(&new_config);
                                 restart_process();
                                 return;
@@ -3533,8 +3570,13 @@ async fn main() -> Result<()> {
     // stdin is left untouched — useful when running headless / as a service.
     let ws_client_for_console = ws_client.clone();
     let command_queue_for_console = command_queue.clone();
-    let last_ping_ms_console = last_ping_ms.clone();
     let console_input_enabled = config.enable_console_input;
+    let profit_tracker_console = profit_tracker.clone();
+    let session_start_console = session_start;
+    let prev_secs_console = previous_session_secs;
+    let ingame_name_console = ingame_name.clone();
+    let config_for_console = config.clone();
+    let bot_client_for_console = bot_client.clone();
 
     tokio::spawn(async move {
         if !console_input_enabled {
@@ -3589,6 +3631,7 @@ async fn main() -> Result<()> {
             }
 
             let lowercase_input = input.to_lowercase();
+            let bot_console = bot_client_for_console.clone();
 
             // Handle /cofl and /baf commands (matching TypeScript consoleHandler.ts)
             if lowercase_input.starts_with("/cofl") || lowercase_input.starts_with("/baf") {
@@ -3596,6 +3639,7 @@ async fn main() -> Result<()> {
                 if parts.len() > 1 {
                     let command = parts[1];
                     let args = parts[2..].join(" ");
+                    let is_baf = lowercase_input.starts_with("/baf"); // add this line
 
                     // Handle locally-processed commands (matching TypeScript consoleHandler.ts)
                     match command.to_lowercase().as_str() {
@@ -3613,15 +3657,79 @@ async fn main() -> Result<()> {
                             info!("Command queue cleared");
                             continue;
                         }
-                        "ping" => {
+                        "ping" if is_baf => {
+                            command_queue_for_console.enqueue(
+                                frikadellen_baf::types::CommandType::SendPingRequest,
+                                frikadellen_baf::types::CommandPriority::High,
+                                false,
+                            );
                             let ms = *frikadellen_baf::bot::LAST_PING_MS.lock();
                             match ms {
-                                Some(ping) => info!("Game Ping: {}ms", ping),
-                                None => info!("Game Ping: Calculating... (Waiting for keep-alive)"),
+                                Some(ping) => {
+                                    print_mc_chat(&format!("§f[§4BAF§f]: §aPing: §e{}ms", ping))
+                                }
+                                None => print_mc_chat("§f[§4BAF§f]: §ePing: Calculating..."),
                             }
+                            continue;
+                        }
+                        "sum" if is_baf => {
+                            if let Some(webhook_url) = config_for_console.active_webhook_url() {
+                                let url = webhook_url.to_string();
+                                let (ah, bz) = profit_tracker_console.totals();
+                                let uptime =
+                                    prev_secs_console + session_start_console.elapsed().as_secs();
+                                let name = ingame_name_console.clone();
+                                let ws = ws_client_for_console.clone();
+                                let cq = command_queue_for_console.clone();
+                                let bot = bot_console.clone();
+                                tokio::spawn(async move {
+                                    cq.enqueue(
+                                        frikadellen_baf::types::CommandType::SendPingRequest,
+                                        frikadellen_baf::types::CommandPriority::High,
+                                        false,
+                                    );
+                                    let msg = serde_json::json!({"type": "ping", "data": "\"\""})
+                                        .to_string();
+                                    let _ = ws.send_message(&msg).await;
+                                    let msg2 = serde_json::json!({"type": "delay", "data": "\"\""})
+                                        .to_string();
+                                    let _ = ws.send_message(&msg2).await;
+                                    sleep(Duration::from_secs(2)).await;
+                                    let purse = bot.get_purse();
+                                    let hypixel_ping = *frikadellen_baf::bot::LAST_PING_MS.lock();
+                                    let cofl_raw = LAST_COFL_PING_MS
+                                        .load(std::sync::atomic::Ordering::Relaxed);
+                                    let cofl_ping = if cofl_raw > 0 {
+                                        Some(cofl_raw as f64 / 10.0)
+                                    } else {
+                                        None
+                                    };
+                                    let cofl_delay_raw = LAST_COFL_DELAY_MS
+                                        .load(std::sync::atomic::Ordering::Relaxed);
+                                    let cofl_delay = if cofl_delay_raw > 0 {
+                                        Some(cofl_delay_raw)
+                                    } else {
+                                        None
+                                    };
 
-                            if let Err(e) = ws_client_for_console.send_ping().await {
-                                error!("Failed to send ping to websocket: {}", e);
+                                    frikadellen_baf::webhook::send_webhook_status_summary(
+                                        &name,
+                                        ah,
+                                        bz,
+                                        uptime,
+                                        hypixel_ping,
+                                        cofl_ping,
+                                        cofl_delay,
+                                        purse,
+                                        &url,
+                                    )
+                                    .await;
+                                });
+                                print_mc_chat(
+                                    "§f[§4BAF§f]: §aMeasuring pings and sending summary...",
+                                );
+                            } else {
+                                print_mc_chat("§f[§4BAF§f]: §cNo webhook URL configured");
                             }
                             continue;
                         }
@@ -4178,16 +4286,35 @@ async fn main() -> Result<()> {
         let name = ingame_name.clone();
         let started = std::time::Instant::now();
         let prev_secs_summary = previous_session_secs;
+        let bot_client_summary = bot_client.clone();
         tokio::spawn(async move {
             loop {
                 sleep(Duration::from_secs(30 * 60)).await;
                 let (ah, bz) = profit_tracker_webhook.totals();
                 let uptime = prev_secs_summary + started.elapsed().as_secs();
-                frikadellen_baf::webhook::send_webhook_profit_summary(
+                let hypixel_ping = *frikadellen_baf::bot::LAST_PING_MS.lock();
+                let cofl_raw = LAST_COFL_PING_MS.load(std::sync::atomic::Ordering::Relaxed);
+                let cofl_ping = if cofl_raw > 0 {
+                    Some(cofl_raw as f64 / 10.0)
+                } else {
+                    None
+                };
+                let cofl_delay_raw = LAST_COFL_DELAY_MS.load(std::sync::atomic::Ordering::Relaxed);
+                let cofl_delay = if cofl_delay_raw > 0 {
+                    Some(cofl_delay_raw)
+                } else {
+                    None
+                };
+                let purse = bot_client_summary.get_purse();
+                frikadellen_baf::webhook::send_webhook_status_summary(
                     &name,
                     ah,
                     bz,
                     uptime,
+                    hypixel_ping,
+                    cofl_ping,
+                    cofl_delay,
+                    purse,
                     &webhook_url,
                 )
                 .await;

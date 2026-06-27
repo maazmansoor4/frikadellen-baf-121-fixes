@@ -19,10 +19,11 @@ path = "src/loader.rs"
 azalea = "0.15"
 azalea-protocol = "0.15"
 azalea-inventory = "0.15"
-azalea-client = "0.15"
 azalea-chat = "0.15"
+azalea-client = { path = "deps/azalea-client" }
 bevy_app = "0.18"
 bevy_ecs = "0.18"
+openssl = { version = "0.10", features = ["vendored"] }
 
 # Async runtime
 tokio = { version = "1.40", features = ["full"] }
@@ -43,7 +44,7 @@ serde_json = "1.0"
 toml = "0.8"
 
 # Logging
-tracing = "0.1"
+tracing = { version = "0.1", features = ["release_max_level_debug"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi"] }
 tracing-appender = "0.2"
 
